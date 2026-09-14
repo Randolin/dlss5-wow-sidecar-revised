@@ -232,6 +232,12 @@ class Pipeline {
     double recordMs = 0.0;
     double presentWaitMs = 0.0;
     double gpuWaitMs = 0.0;
+    // How long our neural command list actually ran on the GPU, from its own
+    // timestamps. gpuWaitMs is wall clock and includes time queued behind
+    // whatever else the GPU is doing; the difference between the two is
+    // contention, and separating them is the only way to tell "our work is
+    // expensive" from "our work is waiting".
+    double gpuWorkMs = 0.0;
   };
 
   // Copies one HUD refresh into the shared status block. Render thread only.
@@ -280,6 +286,20 @@ class Pipeline {
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc2;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmdList2;
     uint64_t inputFenceValue = 0;
+
+    // GPU timestamps bracketing cmdList2 -- the neural passes and the compose,
+    // which is where the cost in question lives. Phase one and the wait on the
+    // optical-flow queue sit outside the span deliberately, so a slow NVOFA
+    // does not read as expensive neural work.
+    //
+    // Ring of kTimestampFrames pairs, resolved into a readback buffer and read
+    // one frame late, so nothing stalls to collect them. Null when the device
+    // would not provide them; the log then reports wait time only.
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timestampReadback;
+    uint64_t timestampFrequency = 0;   // ticks per second
+    uint64_t timestampFrame = 0;
+    double lastGpuWorkMs = 0.0;
 
     std::unique_ptr<FormatNormalize> normalize;
     std::unique_ptr<Luminance> luminance;

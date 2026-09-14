@@ -10,6 +10,10 @@
 #include <d3d11_4.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
 #include "gpu/DeviceBridge.h"
 #include "core/Log.h"
 
@@ -28,6 +32,10 @@ struct WgcSource::Impl {
   DeviceBridge* bridge = nullptr;
   WgcSource::DropCallback onDrop;
   WgcSource* owner = nullptr;
+  // Whether this Windows has MinUpdateInterval at all, and what we last asked
+  // for, so the render loop can drive it without a call per frame.
+  bool canSetInterval = false;
+  double intervalMs = 1.0;
 };
 
 namespace {
@@ -136,8 +144,11 @@ std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target, DeviceBridge&
     const winrt::Windows::Foundation::TimeSpan interval{10000};
     try {
       s->impl_->session.MinUpdateInterval(interval);
+      s->impl_->canSetInterval = true;
+      s->impl_->intervalMs = 1.0;
       GlobalLog().Info("capture: minimum update interval set to 1 ms (the OS default is "
-                       "16.67 ms, which caps capture at 60 fps)");
+                       "16.67 ms, which caps capture at 60 fps); the render loop raises it "
+                       "to match what it can actually present");
     } catch (const winrt::hresult_error& e) {
       GlobalLog().Warn("capture: could not set the minimum update interval (" +
                        winrt::to_string(e.message()) + "); capture may be capped at 60 fps");
@@ -149,6 +160,33 @@ std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target, DeviceBridge&
 }
 
 WgcSource::~WgcSource() { Stop(); }
+
+void WgcSource::SetMinUpdateIntervalMs(double ms) {
+  if (!impl_ || !impl_->session || !impl_->canSetInterval) return;
+  // Never slower than 30 fps of requests, whatever the present rate says: a
+  // transient stall must not throttle capture into a hole it cannot climb out
+  // of, and a stale frame is worse than a wasted one.
+  const double clamped = std::clamp(ms, 1.0, 33.0);
+  // Only when it has moved enough to matter. The rate this is derived from
+  // jitters by a frame or two, and every set is a call into the compositor.
+  if (std::abs(clamped - impl_->intervalMs) < 0.2 * impl_->intervalMs) return;
+  const winrt::Windows::Foundation::TimeSpan interval{
+      static_cast<int64_t>(clamped * 10000.0)};   // 100 ns units
+  try {
+    impl_->session.MinUpdateInterval(interval);
+    impl_->intervalMs = clamped;
+    char line[128];
+    std::snprintf(line, sizeof(line),
+                  "capture: asking for a frame every %.1f ms (%.0f fps of requests)",
+                  clamped, 1000.0 / clamped);
+    GlobalLog().Info(line);
+  } catch (const winrt::hresult_error& e) {
+    // Stop trying rather than log once per update forever.
+    impl_->canSetInterval = false;
+    GlobalLog().Warn("capture: the minimum update interval was refused (" +
+                     winrt::to_string(e.message()) + "); leaving it where it is");
+  }
+}
 
 bool WgcSource::IsClosed() const {
   if (closed_.load(std::memory_order_acquire)) return true;

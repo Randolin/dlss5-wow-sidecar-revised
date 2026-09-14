@@ -27,6 +27,9 @@ using Clock = std::chrono::steady_clock;
 namespace sidecar {
 namespace {
 
+constexpr uint32_t kTimestampFrames = 3;   // pairs of timestamps in flight
+constexpr uint32_t kTimestampSlots = kTimestampFrames * 2;
+
 // Two decimals is the useful precision for a millisecond figure; std::to_string
 // would print six and bury it.
 std::string FormatMs(double ms) {
@@ -201,6 +204,40 @@ std::unique_ptr<Pipeline> Pipeline::Create(const GpuInfo& gpu,
                                     nullptr, IID_PPV_ARGS(&p->dev_.cmdList2)))) return nullptr;
   p->dev_.cmdList2->Close();
 
+  // GPU timestamps around the neural command list. Optional: a device that
+  // refuses them costs us the measurement, not the overlay.
+  {
+    D3D12_QUERY_HEAP_DESC qh{};
+    qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qh.Count = kTimestampSlots;
+    if (SUCCEEDED(dev->CreateQueryHeap(&qh, IID_PPV_ARGS(&p->dev_.timestampHeap)))) {
+      D3D12_HEAP_PROPERTIES tsHeap{};
+      tsHeap.Type = D3D12_HEAP_TYPE_READBACK;
+      D3D12_RESOURCE_DESC tsDesc{};
+      tsDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      tsDesc.Width = sizeof(uint64_t) * kTimestampSlots;
+      tsDesc.Height = 1;
+      tsDesc.DepthOrArraySize = 1;
+      tsDesc.MipLevels = 1;
+      tsDesc.SampleDesc.Count = 1;
+      tsDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      if (FAILED(dev->CreateCommittedResource(&tsHeap, D3D12_HEAP_FLAG_NONE, &tsDesc,
+                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&p->dev_.timestampReadback)))) {
+        p->dev_.timestampHeap.Reset();
+      }
+    }
+    if (p->dev_.timestampHeap &&
+        FAILED(p->dev_.bridge->Queue()->GetTimestampFrequency(&p->dev_.timestampFrequency))) {
+      p->dev_.timestampHeap.Reset();
+      p->dev_.timestampReadback.Reset();
+    }
+    if (!p->dev_.timestampHeap) {
+      GlobalLog().Warn("GPU timestamps are unavailable on this device; the log will report "
+                       "wait time only, which cannot separate our cost from contention.");
+    }
+  }
+
   // Optical flow and its consumers. Every one of these is optional: a failure
   // here costs motion vectors, not the frame, so the pipeline still runs with
   // a static-scene assumption (spec section 11).
@@ -249,6 +286,7 @@ std::unique_ptr<Pipeline> Pipeline::Create(const GpuInfo& gpu,
     ctx.depthGradient = config.depthGradient;
     ctx.depthInverted = config.depthInverted;
     ctx.nr = config.nr;
+    ctx.timestampFrequency = p->dev_.timestampFrequency;
 
     std::vector<std::string> warnings;
     p->dev_.pass = MakeNeuralPass(config.neuralPass, ctx, warnings);
@@ -1066,6 +1104,7 @@ void Pipeline::RenderLoop() {
   // something actually changed. A line every ten seconds saying the same thing
   // is what made these logs unreadable.
   std::string lastPerfLine;
+  std::string stageLine;
   auto lastPerfReport = Clock::now();
   // Wall-clock interval between presents, the last two seconds' worth. This is
   // the frame rate the eye sees, and the shape of it -- a hitch, a comb -- is
@@ -1082,6 +1121,7 @@ void Pipeline::RenderLoop() {
   double recordMs = 0.0;
   double presentWaitMs = 0.0;
   double gpuWaitMs = 0.0;
+  double gpuWorkMs = 0.0;
   uint64_t framesThisWindow = 0;
   uint64_t deliveredAtWindowStart = dev_.source ? dev_.source->FramesDelivered() : 0;
   auto windowBegan = Clock::now();
@@ -1244,6 +1284,12 @@ void Pipeline::RenderLoop() {
     dev_.alloc2->Reset();
     dev_.cmdList2->Reset(dev_.alloc2.Get(), nullptr);
 
+    const uint32_t tsSlot =
+        static_cast<uint32_t>(dev_.timestampFrame % kTimestampFrames) * 2;
+    if (dev_.timestampHeap) {
+      dev_.cmdList2->EndQuery(dev_.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlot);
+    }
+
     if (haveFlow && dev_.flowToMv && dev_.motionTarget) {
       dev_.bridge->Queue()->Wait(dev_.flow->OutputFence(), flowOut.readyFenceValue);
       dev_.flowToMv->Record(dev_.cmdList2.Get(), flowOut, dev_.motionTarget.Get());
@@ -1368,6 +1414,14 @@ void Pipeline::RenderLoop() {
       dev_.cmdList2->ResourceBarrier(2, after);
     }
 
+    if (dev_.timestampHeap) {
+      dev_.cmdList2->EndQuery(dev_.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                              tsSlot + 1);
+      dev_.cmdList2->ResolveQueryData(dev_.timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                      tsSlot, 2, dev_.timestampReadback.Get(),
+                                      sizeof(uint64_t) * tsSlot);
+    }
+
     dev_.cmdList2->Close();
     if (!ok) {
       // Spec section 11: an unusable neural pass degrades to passthrough and
@@ -1411,6 +1465,27 @@ void Pipeline::RenderLoop() {
       lastPresent = now;
       presentedBefore = true;
     }
+
+    // Collect the previous frame's timestamps. Its work has certainly retired:
+    // the present above waited on the GPU before the loop came back around.
+    // Reading one frame late is what keeps this from being another stall.
+    if (dev_.timestampHeap && dev_.timestampFrame > 0) {
+      const uint32_t prev =
+          static_cast<uint32_t>((dev_.timestampFrame - 1) % kTimestampFrames) * 2;
+      void* ticks = nullptr;
+      D3D12_RANGE read{sizeof(uint64_t) * prev, sizeof(uint64_t) * (prev + 2)};
+      if (SUCCEEDED(dev_.timestampReadback->Map(0, &read, &ticks)) && ticks) {
+        const auto* t = static_cast<const uint64_t*>(ticks);
+        if (dev_.timestampFrequency > 0 && t[prev + 1] > t[prev]) {
+          dev_.lastGpuWorkMs = 1000.0 * static_cast<double>(t[prev + 1] - t[prev]) /
+                               static_cast<double>(dev_.timestampFrequency);
+        }
+        D3D12_RANGE wrote{0, 0};
+        dev_.timestampReadback->Unmap(0, &wrote);
+      }
+    }
+    ++dev_.timestampFrame;
+    gpuWorkMs += dev_.lastGpuWorkMs;
 
     if (dumpRequested_.exchange(false, std::memory_order_acq_rel)) DumpDebugFrames();
     if (const int step = calibrationRequest_.exchange(0, std::memory_order_acq_rel)) {
@@ -1471,6 +1546,13 @@ void Pipeline::RenderLoop() {
         model.modelWidth = direct->WorkWidth();
         model.modelHeight = direct->WorkHeight();
         model.passCount = static_cast<int>(direct->PassCount());
+        stageLine.clear();
+        for (const auto& [name, ms] : direct->StageTimings()) {
+          char part[48];
+          std::snprintf(part, sizeof(part), "%s%s %.1f", stageLine.empty() ? "" : ", ",
+                        name.c_str(), ms);
+          stageLine += part;
+        }
       }
       std::string presetName;
       {
@@ -1522,9 +1604,21 @@ void Pipeline::RenderLoop() {
       budget.recordMs = recordMs / perFrame;
       budget.presentWaitMs = presentWaitMs / perFrame;
       budget.gpuWaitMs = gpuWaitMs / perFrame;
+      budget.gpuWorkMs = gpuWorkMs / perFrame;
       model.captureFps = budget.captureFps;
       if (dev_.hud) dev_.hud->Update(model);
       PublishStatus(model, budget);
+
+      // Ask capture for roughly twice the rate we can actually present: enough
+      // that the frame waiting for us is always fresh, without paying for a
+      // full-resolution copy of everything we would only throw away. This does
+      // not raise the presented rate -- that was measured and it does not --
+      // it stops the pipeline doing work nobody consumes. Self-correcting in
+      // both directions, since the request rate is always tied to the present
+      // rate and a recovery raises it again on the next window.
+      if (dev_.source && budget.fps > 1.0) {
+        dev_.source->SetMinUpdateIntervalMs(1000.0 / (budget.fps * 2.0));
+      }
 
       // Periodically to the log, but only when the picture has changed. The
       // line is bucketed before it is compared, so ordinary jitter does not
@@ -1541,14 +1635,17 @@ void Pipeline::RenderLoop() {
                       bucket(budget.gpuWaitMs, 2.0), dev_.pass->Name());
         const bool stale = std::chrono::duration<double>(now - lastPerfReport).count() > 60.0;
         if (summary != lastPerfLine || stale) {
-          char line[384];
+          char line[448];
           std::snprintf(line, sizeof(line),
-                        "%.0f fps presented, %.0f captured | per frame: gpu %.1f, cpu %.1f, "
-                        "idle %.1f, present %.1f ms | p50 %.1f, p99 %.1f | %llu dropped",
-                        budget.fps, budget.captureFps, budget.gpuWaitMs, budget.recordMs,
-                        budget.idleMs, budget.presentWaitMs, stats_.P50(), stats_.P99(),
+                        "%.0f fps presented, %.0f captured | per frame: gpu work %.1f, "
+                        "gpu wait %.1f, cpu %.1f, idle %.1f, present %.1f ms | p50 %.1f, "
+                        "p99 %.1f | %llu dropped",
+                        budget.fps, budget.captureFps, budget.gpuWorkMs, budget.gpuWaitMs,
+                        budget.recordMs, budget.idleMs, budget.presentWaitMs, stats_.P50(),
+                        stats_.P99(),
                         static_cast<unsigned long long>(stats_.Dropped()));
           GlobalLog().Info(line);
+          if (!stageLine.empty()) GlobalLog().Info("  stages (ms): " + stageLine);
           lastPerfLine = summary;
           lastPerfReport = now;
         }
@@ -1559,6 +1656,7 @@ void Pipeline::RenderLoop() {
       recordMs = 0.0;
       presentWaitMs = 0.0;
       gpuWaitMs = 0.0;
+      gpuWorkMs = 0.0;
       framesThisWindow = 0;
       windowBegan = now;
     }

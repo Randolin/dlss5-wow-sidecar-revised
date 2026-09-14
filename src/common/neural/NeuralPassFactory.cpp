@@ -67,6 +67,7 @@ std::unique_ptr<INeuralPass> MakeNeuralPass(std::string_view name,
     options.depthInverted = context.depthInverted;
     options.setup = SetupFromSettings(context.nr);
     options.bridge = BridgeFromSettings(context.nr);
+    options.timestampFrequency = context.timestampFrequency;
 
     std::string reason;
     if (auto pass = DirectNrPass::Create(context.device, options, reason)) {

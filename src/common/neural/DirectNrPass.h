@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/GpuProfile.h"
@@ -79,6 +80,9 @@ class DirectNrPass : public INeuralPass {
     bool depthInverted = false;
     NrPassSetup setup;
     NrBridgeParams bridge;
+    // Ticks per second on the queue this pass records into, for the per-stage
+    // timestamps. 0 disables them.
+    uint64_t timestampFrequency = 0;
   };
 
   static std::unique_ptr<DirectNrPass> Create(ID3D12Device* device, const Options& options,
@@ -106,6 +110,15 @@ class DirectNrPass : public INeuralPass {
   size_t PassCount() const { return current_.passes.size(); }
   uint32_t WorkWidth() const { return current_.workWidth; }
   uint32_t WorkHeight() const { return current_.workHeight; }
+
+  // Where the GPU time inside Evaluate went, one entry per stage, in
+  // milliseconds, from the frame before last. Empty when timestamps are
+  // unavailable. The whole point is to stop guessing which stage is expensive:
+  // the model's own evaluations and the compose passes around them are very
+  // different things to optimise.
+  const std::vector<std::pair<std::string, double>>& StageTimings() const {
+    return lastStages_;
+  }
 
  private:
   DirectNrPass() = default;
@@ -141,6 +154,20 @@ class DirectNrPass : public INeuralPass {
 
   bool PrepareDepth(ID3D12Device* device, float value, bool gradient, bool inverted);
   bool BuildGeneration(const NrPassSetup& setup, Generation& out) const;
+
+  // Per-stage GPU timestamps inside Evaluate. Slot layout within a frame:
+  // 0 begin, 1 after the input is prepared, then for each pass i: 2+2i after
+  // its evaluation and 3+2i after the chained compose that follows it (only
+  // between passes, so the last pass has none), and 2n+1 after the compose
+  // that writes the output. Every slot up to the last must be written, or a
+  // difference against an unwritten one reports a raw tick count.
+  static constexpr uint32_t kStageSlots = 12;    // enough for four passes
+  static constexpr uint32_t kStageFrames = 3;
+  bool CreateStageQueries(ID3D12Device* device, uint64_t frequency);
+  void MarkStage(ID3D12GraphicsCommandList* cl, uint32_t slot);
+  void ResolveStages(ID3D12GraphicsCommandList* cl);
+  void CollectStages();
+
   bool CreateFeatures(ID3D12GraphicsCommandList* cl, Generation& gen);
   void ReleaseFeatures(Generation& gen);
   void CopyThrough(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, ID3D12Resource* out);
@@ -178,6 +205,15 @@ class DirectNrPass : public INeuralPass {
   bool reset_ = true;
   uint64_t frames_ = 0;
   uint32_t consecutiveFailures_ = 0;
+
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> stageHeap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> stageReadback_;
+  uint64_t stageFrequency_ = 0;
+  uint64_t stageFrame_ = 0;
+  uint32_t stageUsed_ = 0;       // slots written last frame
+  size_t stagePasses_ = 0;       // passes that frame, for the labels
+  bool stageChained_ = false;
+  std::vector<std::pair<std::string, double>> lastStages_;
 };
 
 }  // namespace sidecar

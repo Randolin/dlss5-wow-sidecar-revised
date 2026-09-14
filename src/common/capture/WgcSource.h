@@ -27,6 +27,18 @@ class WgcSource {
   void Start();
   void Stop();
 
+  // Ask the compositor not to deliver frames faster than this. The render loop
+  // drives it from its own present rate.
+  //
+  // This does not make the overlay faster -- measured: capture fell from ~130
+  // to ~30 fps of requests with no change to the presented rate. What it saves
+  // is the work behind the discarded frames: at 1 ms every capture is a
+  // full-resolution copy into the ring, and most of them were being thrown
+  // away. Worth doing for the GPU time, bandwidth and power, not for the frame
+  // rate. Clamped to a sane range; a no-op on a Windows without the
+  // MinUpdateInterval property. Safe from the render thread.
+  void SetMinUpdateIntervalMs(double ms);
+
   // True once the target window is gone. The runtime treats this as "WoW
   // exited". WGC's own Closed event is the fast path, but it does not fire
   // when the owning process is terminated outright, so the window itself is

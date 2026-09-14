@@ -43,6 +43,9 @@ std::unique_ptr<DeviceBridge> DeviceBridge::Create(LUID adapterLuid,
   }
   D3D12_COMMAND_QUEUE_DESC qd{};
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  // Default priority. HIGH was tried and made no measurable difference to the
+  // presented rate against an uncapped game; see
+  // docs/spikes/2026-09-14-gpu-contention.md.
   if (FAILED(b->d3d12_->CreateCommandQueue(&qd, IID_PPV_ARGS(&b->queue_)))) return nullptr;
 
   // Shared fence: signalled on the D3D11 context, waited on the D3D12 queue.

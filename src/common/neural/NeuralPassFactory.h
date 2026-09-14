@@ -38,6 +38,11 @@ struct NeuralPassContext {
 
   // The direct path's settings.
   NrSettings nr;
+
+  // Ticks per second on the queue the pass records into, for its per-stage
+  // GPU timestamps. 0 means the caller could not obtain it and the pass runs
+  // without the breakdown.
+  uint64_t timestampFrequency = 0;
 };
 
 // Builds the neural pass named in the config file: "direct" or "passthrough".

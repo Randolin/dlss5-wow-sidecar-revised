@@ -210,6 +210,10 @@ std::unique_ptr<DirectNrPass> DirectNrPass::Create(ID3D12Device* device,
     reason = "the colour bridge's compute pipelines could not be created";
     return nullptr;
   }
+  if (!p->CreateStageQueries(device, options.timestampFrequency)) {
+    GlobalLog().Warn("direct NR: per-stage GPU timestamps unavailable; the log cannot "
+                     "say which stage the frame time went to");
+  }
 
   GlobalLog().Info(options.bridge.enabled
                        ? "direct NR: HDR encode ON (experimental), paper white " +
@@ -390,6 +394,85 @@ void DirectNrPass::ReleaseFeatures(Generation& gen) {
   gen.featuresCreated = false;
 }
 
+bool DirectNrPass::CreateStageQueries(ID3D12Device* device, uint64_t frequency) {
+  if (!device || frequency == 0) return false;
+  D3D12_QUERY_HEAP_DESC qh{};
+  qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  qh.Count = kStageSlots * kStageFrames;
+  if (FAILED(device->CreateQueryHeap(&qh, IID_PPV_ARGS(&stageHeap_)))) return false;
+
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  rd.Width = sizeof(uint64_t) * kStageSlots * kStageFrames;
+  rd.Height = 1;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&stageReadback_)))) {
+    stageHeap_.Reset();
+    return false;
+  }
+  stageFrequency_ = frequency;
+  return true;
+}
+
+void DirectNrPass::MarkStage(ID3D12GraphicsCommandList* cl, uint32_t slot) {
+  if (!stageHeap_ || slot >= kStageSlots) return;
+  const uint32_t base = static_cast<uint32_t>(stageFrame_ % kStageFrames) * kStageSlots;
+  cl->EndQuery(stageHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + slot);
+  stageUsed_ = std::max(stageUsed_, slot + 1);
+}
+
+void DirectNrPass::ResolveStages(ID3D12GraphicsCommandList* cl) {
+  if (!stageHeap_ || stageUsed_ == 0) return;
+  const uint32_t base = static_cast<uint32_t>(stageFrame_ % kStageFrames) * kStageSlots;
+  cl->ResolveQueryData(stageHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base, stageUsed_,
+                       stageReadback_.Get(), sizeof(uint64_t) * base);
+}
+
+void DirectNrPass::CollectStages() {
+  // The frame before last: its work has retired, and reading a frame late is
+  // what keeps this from stalling anything.
+  if (!stageHeap_ || stageFrame_ == 0 || stageUsed_ < 2) return;
+  const uint32_t base =
+      static_cast<uint32_t>((stageFrame_ - 1) % kStageFrames) * kStageSlots;
+  void* mapped = nullptr;
+  D3D12_RANGE read{sizeof(uint64_t) * base, sizeof(uint64_t) * (base + stageUsed_)};
+  if (FAILED(stageReadback_->Map(0, &read, &mapped)) || !mapped) return;
+  const auto* t = static_cast<const uint64_t*>(mapped) + base;
+
+  std::vector<std::pair<std::string, double>> stages;
+  const auto span = [&](uint32_t from, uint32_t to) {
+    if (to >= stageUsed_ || t[to] <= t[from]) return 0.0;
+    return 1000.0 * static_cast<double>(t[to] - t[from]) /
+           static_cast<double>(stageFrequency_);
+  };
+  stages.emplace_back("input", span(0, 1));
+  for (size_t i = 0; i < stagePasses_; ++i) {
+    const uint32_t evalEnd = static_cast<uint32_t>(2 + 2 * i);
+    stages.emplace_back("pass" + std::to_string(i + 1), span(evalEnd - 1, evalEnd));
+    if (stageChained_ && i + 1 < stagePasses_) {
+      stages.emplace_back("chain" + std::to_string(i + 1), span(evalEnd, evalEnd + 1));
+    }
+  }
+  // The final compose lands in the slot after the last pass's evaluation:
+  // pass i ends at 2+2i, so the last one ends at 2n, and the compose is 2n+1.
+  // (Writing it at 2n+2 leaves slot 2n+1 unwritten, and differencing against
+  // an unwritten slot yields a raw tick count rather than a duration.)
+  const uint32_t last = static_cast<uint32_t>(1 + 2 * stagePasses_);
+  stages.emplace_back("compose", span(last - 1, last));
+  stages.emplace_back("total", span(0, last));
+
+  D3D12_RANGE wrote{0, 0};
+  stageReadback_->Unmap(0, &wrote);
+  lastStages_ = std::move(stages);
+}
+
 void DirectNrPass::CopyThrough(ID3D12GraphicsCommandList* cl, ID3D12Resource* color,
                                ID3D12Resource* out) {
   if (color->GetDesc().Format != out->GetDesc().Format) {
@@ -528,6 +611,14 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
   const uint32_t workW = gen.workWidth;
   const uint32_t workH = gen.workHeight;
 
+  // Per-stage timing starts here, once the frame is definitely going to run
+  // the model: everything above is bookkeeping that happens whatever the state.
+  CollectStages();
+  stageUsed_ = 0;
+  stagePasses_ = gen.passes.size();
+  stageChained_ = gen.chainComposed && !bridged;
+  MarkStage(cl, 0);
+
   Transition(cl, color, kUav, kSrv);
   Transition(cl, motion, kUav, kSrv);
 
@@ -546,6 +637,7 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
     bridge_->RecordResample(cl, color, gen.modelIn.Get(), workW, workH, kSlotResample);
   }
   Transition(cl, gen.modelIn.Get(), kUav, kSrv);
+  MarkStage(cl, 1);
 
   ID3D12Resource* input = gen.modelIn.Get();
   bool ok = true;
@@ -589,6 +681,7 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
       ok = false;
       break;
     }
+    MarkStage(cl, static_cast<uint32_t>(2 + 2 * i));
     if (!last) {
       Transition(cl, target, kUav, kSrv);
       ++rawHandedOff;
@@ -611,6 +704,7 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
         Transition(cl, composed, kUav, kSrv);
         ++chainedHandedOff;
         input = composed;
+        MarkStage(cl, static_cast<uint32_t>(3 + 2 * i));
       } else {
         input = target;
       }
@@ -633,7 +727,10 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
                              bridgeParams_, kSlotFinal);
     }
     Transition(cl, gen.modelOut.Get(), kSrv, kUav);
+    MarkStage(cl, static_cast<uint32_t>(1 + 2 * gen.passes.size()));
+    ResolveStages(cl);
   }
+  ++stageFrame_;
 
   for (size_t i = 0; i < rawHandedOff; ++i) Transition(cl, gen.intermediates[i].Get(), kSrv, kUav);
   for (size_t i = 0; i < chainedHandedOff; ++i) Transition(cl, gen.chained[i].Get(), kSrv, kUav);
