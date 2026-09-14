@@ -61,11 +61,20 @@ class DeviceBridge {
   // Render thread. Returns the newest published-but-unconsumed frame and marks
   // it consumed. The caller must have the queue wait on SharedFence() at the
   // returned fenceValue before reading the texture.
+  //
+  // The returned slot is pinned until the next AcquireLatest, so the capture
+  // thread cannot write into a texture the render thread's command lists are
+  // still reading. Call it once per frame and finish with the frame before
+  // calling it again -- which the render loop does, because the overlay's
+  // present waits on the GPU before the loop comes back around.
   std::optional<BridgeFrame> AcquireLatest();
 
  private:
   DeviceBridge() = default;
   bool Commit();
+  // The next slot the capture thread may write: neither the pinned one nor the
+  // published-but-unclaimed one.
+  uint32_t NextWritableSlot() const;
 
   struct Slot {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> tex11;
@@ -89,6 +98,18 @@ class DeviceBridge {
   // -1 means "nothing published". Written by the capture thread, read and
   // cleared by the render thread.
   std::atomic<int32_t> published_{-1};
+
+  // The slot the render thread currently holds, or -1. The capture thread
+  // refuses to write into it.
+  //
+  // Without this the producer laps the consumer whenever the game runs fast
+  // enough to deliver three frames inside one of our frames, and overwrites
+  // the texture our command lists are reading. The symptom is a double
+  // exposure in the presented frame while the neural pass's own output stays
+  // clean -- the model ran on one frame and the compose re-read the slot after
+  // it had become a different one. It is area-dependent because it depends on
+  // the game's frame rate, not on anything in the scene.
+  std::atomic<int32_t> inFlight_{-1};
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;

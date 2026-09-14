@@ -118,9 +118,9 @@ void Paint(HDC dc, const HudModel& m) {
 
   // What is running.
   if (m.modelWidth > 0) {
-    std::snprintf(line, sizeof(line), "%s  %s  %ux%u -> %ux%u  x%d%s%s", m.preset,
+    std::snprintf(line, sizeof(line), "%s  %s  %ux%u -> %ux%u  x%d%s", m.preset,
                   m.passName, m.width, m.height, m.modelWidth, m.modelHeight, m.passCount,
-                  m.temporal ? "  temporal" : "", m.hdr ? "  HDR" : "");
+                  m.hdr ? "  HDR" : "");
   } else {
     std::snprintf(line, sizeof(line), "%s  %s  %ux%u%s", m.preset, m.passName, m.width,
                   m.height, m.hdr ? "  HDR" : "");

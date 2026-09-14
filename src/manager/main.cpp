@@ -1371,8 +1371,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         SaveConfig(configPath, config);
       }
       Hint("Shows the settings that are rarely worth touching: the pipeline internals, "
-           "the model's preset slot and its own mask switches, pass chaining, per-pass "
-           "tuning and temporal stabilisation. Hiding them changes nothing about what "
+           "the model's preset slot and its own mask switches, pass chaining and "
+           "per-pass tuning. Hiding them changes nothing about what "
            "the overlay does -- the values keep working, they are just out of the way.");
 
       if (config.advancedTuning) {
@@ -1484,28 +1484,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
              "and rolls off what is left before it clips. On an SDR desktop there is no "
              "headroom to pass highlights through, so this is what keeps a bright scene "
              "from going to paper. Darkening is always kept.");
-
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        if (config.advancedTuning) {
-        ImGui::TextUnformatted("Temporal stabilisation");
-        ImGui::SetNextItemWidth(440.0f);
-        if (ImGui::SliderFloat("Smoothing", &config.nr.temporalSmoothing, 0.0f, 0.95f, "%.2f")) {
-          dirty = true;
-        }
-        Hint("Steadies the model's lighting decision over time -- the shimmer on a "
-             "scene you are standing still in -- by reusing last frame's edit where "
-             "the frame did not change. Only the edit is smoothed; detail comes from "
-             "the frame and does not soften. 0 is off and costs nothing.");
-        {
-          const bool on = config.nr.temporalSmoothing > 0.0f;
-          if (!on) ImGui::BeginDisabled();
-          if (ImGui::Checkbox("Guided blur of the edit", &config.nr.temporalSpatial)) dirty = true;
-          if (!on) ImGui::EndDisabled();
-        }
-        Hint("A small edge-aware blur of this frame's edit before it is blended, for "
-             "the sub-pixel flicker the frame-to-frame blend cannot catch.");
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        }   // advanced: temporal stabilisation
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::TextUnformatted("HDR games");

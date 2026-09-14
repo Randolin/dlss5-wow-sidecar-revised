@@ -12,7 +12,6 @@
 
 #include "core/GpuProfile.h"
 #include "gpu/NrColorBridge.h"
-#include "gpu/NrTemporal.h"
 #include "neural/INeuralPass.h"
 #include "neural/NgxSession.h"
 #include "neural/NrForwarder.h"
@@ -124,16 +123,11 @@ class DirectNrPass : public INeuralPass {
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> chained;
     Microsoft::WRL::ComPtr<ID3D12Resource> modelIn;
     Microsoft::WRL::ComPtr<ID3D12Resource> modelOut;
-    // Temporal stabilisation, at work size. Both null when smoothing is 0;
-    // created on demand when it is turned on and released when it is turned
-    // off, so the off state carries no allocation and records no pass.
-    std::unique_ptr<NrTemporal> temporal;
-    Microsoft::WRL::ComPtr<ID3D12Resource> stabilised;
     uint32_t workWidth = 0;
     uint32_t workHeight = 0;
     // The last pass's size: the full frame when finalFull is on with more
-    // than one pass, else the working size. modelOut, the last chained input
-    // and the stabiliser are at this size.
+    // than one pass, else the working size. modelOut and the last chained
+    // input are at this size.
     uint32_t finalWidth = 0;
     uint32_t finalHeight = 0;
     bool finalFull = false;
@@ -147,9 +141,6 @@ class DirectNrPass : public INeuralPass {
 
   bool PrepareDepth(ID3D12Device* device, float value, bool gradient, bool inverted);
   bool BuildGeneration(const NrPassSetup& setup, Generation& out) const;
-  // Brings the generation's temporal state in line with the current params:
-  // allocates when smoothing turned on, releases when it turned off.
-  void SyncTemporal(Generation& gen);
   bool CreateFeatures(ID3D12GraphicsCommandList* cl, Generation& gen);
   void ReleaseFeatures(Generation& gen);
   void CopyThrough(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, ID3D12Resource* out);

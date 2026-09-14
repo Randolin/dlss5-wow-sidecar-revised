@@ -96,7 +96,24 @@ DeviceBridge::~DeviceBridge() {
   if (frameReady_) CloseHandle(frameReady_);
 }
 
+uint32_t DeviceBridge::NextWritableSlot() const {
+  // Two slots are off limits: the one the render thread holds, and the one
+  // that is published but not yet claimed -- the render thread can take that
+  // one at any moment, and a copy landing in it mid-acquire is the same tear
+  // by another route. Three slots is exactly enough to always leave one free,
+  // which is why the ring is three deep.
+  const int32_t pinned = inFlight_.load(std::memory_order_acquire);
+  const int32_t ready = published_.load(std::memory_order_acquire);
+  for (uint32_t step = 0; step < kRingDepth; ++step) {
+    const uint32_t candidate = (writeIndex_ + step) % kRingDepth;
+    const int32_t asInt = static_cast<int32_t>(candidate);
+    if (asInt != pinned && asInt != ready) return candidate;
+  }
+  return writeIndex_;   // cannot happen with three slots; write somewhere
+}
+
 bool DeviceBridge::Publish(ID3D11Texture2D* src) {
+  writeIndex_ = NextWritableSlot();
   Slot& slot = ring_[writeIndex_];
   d3d11Ctx_->CopyResource(slot.tex11.Get(), src);
   return Commit();
@@ -125,6 +142,12 @@ bool DeviceBridge::WaitForFrame(uint32_t timeoutMs) const {
 std::optional<BridgeFrame> DeviceBridge::AcquireLatest() {
   const int32_t index = published_.exchange(-1, std::memory_order_acquire);
   if (index < 0) return std::nullopt;
+
+  // Pin it, releasing whatever the previous frame held. The release is safe
+  // here rather than at the end of the frame because the caller is only back
+  // in this function once the overlay's present has waited on the GPU, so the
+  // command lists reading the old slot have retired.
+  inFlight_.store(index, std::memory_order_release);
 
   const Slot& slot = ring_[static_cast<size_t>(index)];
   BridgeFrame f;

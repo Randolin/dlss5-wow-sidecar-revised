@@ -142,6 +142,7 @@ void ReadNrPass(const toml::table& table, NrPassSettings& s, const std::string& 
                           k == "temporal_spatial" || k == "temporal_reproject" ||
                           k == "evaluate_every" || k == "final_pass_full" ||
                           k == "per_pass_tuning" || k == "split_view" ||
+                          k == "motion_vectors" || k == "model_temporal" ||
                           k == "hdr_headroom";   // headroom/reproject/every are retired
     if (passKey) continue;
     if (frameKey && topLevel) continue;
@@ -172,10 +173,13 @@ void ReadNrTable(const toml::table& table, NrSettings& nr, const std::string& wh
   ReadFloat(table, "colour_preserve", nr.colourPreserve, 0.0f, 1.0f, warnings);
   ReadFloat(table, "highlight_protect", nr.highlightProtect, 0.0f, 1.0f, warnings);
   ReadFloat(table, "split_view", nr.splitView, 0.0f, 1.0f, warnings);
-  ReadFloat(table, "temporal_smoothing", nr.temporalSmoothing, 0.0f, 0.95f, warnings);
-  ReadBool(table, "temporal_spatial", nr.temporalSpatial, warnings);
-  // temporal_reproject and evaluate_every are retired: reprojection along
-  // estimated vectors ghosted and half-rate needed it. Both read and ignored.
+  // motion_vectors and model_temporal are retired: the runtime refuses to
+  // evaluate without a motion field and its reset flag does nothing.
+  // temporal_smoothing and temporal_spatial are retired too: the stabiliser
+  // they drove was compensating for negated motion vectors and went with the
+  // fix. temporal_reproject and evaluate_every are older retirements --
+  // reprojection along estimated vectors ghosted, half-rate needed it. All
+  // accepted silently so an older file does not warn.
   ReadFloat(table, "model_scale", nr.modelScale, 0.5f, 1.0f, warnings);
   ReadBool(table, "final_pass_full", nr.finalPassFull, warnings);
   ReadBool(table, "per_pass_tuning", nr.perPassTuning, warnings);
@@ -226,8 +230,6 @@ void WriteNrTable(std::ostringstream& out, const NrSettings& nr, const std::stri
   out << "colour_preserve = " << Number(nr.colourPreserve) << "\n";
   out << "highlight_protect = " << Number(nr.highlightProtect) << "\n";
   out << "split_view = " << Number(nr.splitView) << "\n";
-  out << "temporal_smoothing = " << Number(nr.temporalSmoothing) << "\n";
-  out << "temporal_spatial = " << Boolean(nr.temporalSpatial) << "\n";
   out << "model_scale = " << Number(nr.modelScale) << "\n";
   out << "final_pass_full = " << Boolean(nr.finalPassFull) << "\n";
   out << "per_pass_tuning = " << Boolean(nr.perPassTuning) << "\n";
@@ -479,7 +481,6 @@ bool SameNrPass(const NrPassSettings& a, const NrPassSettings& b) {
 bool SameNr(const NrSettings& a, const NrSettings& b) {
   if (a.bridge != b.bridge || a.paperWhiteNits != b.paperWhiteNits ||
       a.colourPreserve != b.colourPreserve || a.highlightProtect != b.highlightProtect ||
-      a.temporalSmoothing != b.temporalSmoothing || a.temporalSpatial != b.temporalSpatial ||
       a.modelScale != b.modelScale || a.finalPassFull != b.finalPassFull ||
       a.chainComposed != b.chainComposed) {
     return false;
@@ -517,7 +518,6 @@ const std::vector<Preset>& BuiltinPresets() {
     recommended.builtin = true;
     recommended.nr.colourPreserve = 0.90f;
     recommended.nr.highlightProtect = 0.60f;
-    recommended.nr.temporalSmoothing = 0.60f;
     recommended.nr.modelScale = 0.50f;
     recommended.nr.finalPassFull = true;
     NrPassSettings pass;

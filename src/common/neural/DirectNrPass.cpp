@@ -210,7 +210,6 @@ std::unique_ptr<DirectNrPass> DirectNrPass::Create(ID3D12Device* device,
     reason = "the colour bridge's compute pipelines could not be created";
     return nullptr;
   }
-  p->SyncTemporal(p->current_);
 
   GlobalLog().Info(options.bridge.enabled
                        ? "direct NR: HDR encode ON (experimental), paper white " +
@@ -409,26 +408,6 @@ void DirectNrPass::CopyThrough(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
   Transition(cl, out, D3D12_RESOURCE_STATE_COPY_DEST, kUav);
 }
 
-void DirectNrPass::SyncTemporal(Generation& gen) {
-  const bool wanted = bridgeParams_.temporalSmoothing > 0.0f;
-  if (wanted && !gen.temporal) {
-    gen.temporal = NrTemporal::Create(device_.Get(), gen.finalWidth, gen.finalHeight);
-    gen.stabilised = MakeRgba16f(device_.Get(), gen.finalWidth, gen.finalHeight);
-    if (!gen.temporal || !gen.stabilised) {
-      GlobalLog().Warn("direct NR: temporal stabilisation could not be allocated; running "
-                       "without it");
-      gen.temporal.reset();
-      gen.stabilised.Reset();
-    } else {
-      GlobalLog().Info("direct NR: temporal stabilisation on");
-    }
-  } else if (!wanted && gen.temporal) {
-    gen.temporal.reset();
-    gen.stabilised.Reset();
-    GlobalLog().Info("direct NR: temporal stabilisation off");
-  }
-}
-
 void DirectNrPass::TakePending() {
   std::optional<NrBridgeParams> compose;
   std::optional<NrPassSetup> setup;
@@ -441,10 +420,7 @@ void DirectNrPass::TakePending() {
     bridgeParams_ = *compose;
     GlobalLog().Info("direct NR: compose updated live: strength " + Short(compose->strength) +
                      ", colour preserve " + Short(compose->colourPreserve) +
-                     ", highlight protect " + Short(compose->highlightProtect) +
-                     ", temporal " + Short(compose->temporalSmoothing));
-    // The GPU is idle between frames, so allocating or releasing here is safe.
-    SyncTemporal(current_);
+                     ", highlight protect " + Short(compose->highlightProtect));
   }
   if (setup) {
     // The GPU is idle between frames (the overlay's present waits on its
@@ -509,7 +485,6 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
       ReleaseFeatures(current_);
       current_ = std::move(*next_);
       next_.reset();
-      SyncTemporal(current_);
       name_ = "direct DLSS 5 NR x" + std::to_string(current_.passes.size());
       reset_ = true;
       GlobalLog().Info("direct NR: switched to the new setup.");
@@ -650,24 +625,13 @@ bool DirectNrPass::Evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* color
     // it against the last pass's own input would keep only that pass's
     // increment and throw the chain away.
     ID3D12Resource* shown = gen.finalFull ? color : gen.modelIn.Get();
-    ID3D12Resource* result = gen.modelOut.Get();
-    if (gen.temporal && gen.stabilised && !bridged) {
-      if (reset_) gen.temporal->Reset();
-      NrTemporal::Params tp;
-      tp.smoothing = bridgeParams_.temporalSmoothing;
-      tp.spatial = bridgeParams_.temporalSpatial;
-      gen.temporal->Record(cl, shown, gen.modelOut.Get(), gen.stabilised.Get(), tp);
-      Transition(cl, gen.stabilised.Get(), kUav, kSrv);
-      result = gen.stabilised.Get();
-    }
     if (bridged) {
       bridge_->RecordResolve(cl, color, gen.modelOut.Get(), out, width_, height_, bridgeParams_,
                              kSlotFinal);
     } else {
-      bridge_->RecordCompose(cl, color, shown, result, out, width_, height_, bridgeParams_,
-                             kSlotFinal);
+      bridge_->RecordCompose(cl, color, shown, gen.modelOut.Get(), out, width_, height_,
+                             bridgeParams_, kSlotFinal);
     }
-    if (result == gen.stabilised.Get()) Transition(cl, gen.stabilised.Get(), kSrv, kUav);
     Transition(cl, gen.modelOut.Get(), kSrv, kUav);
   }
 

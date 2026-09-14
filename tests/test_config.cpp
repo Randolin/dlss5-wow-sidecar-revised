@@ -252,11 +252,12 @@ TEST_CASE("the compose settings are whole-frame, not per pass", "[unit]") {
   REQUIRE(defaults.nr.paperWhiteNits == 0.0f);   // automatic
   REQUIRE(defaults.nr.colourPreserve == 1.0f);
   REQUIRE(defaults.nr.highlightProtect == 0.6f);
-  REQUIRE(defaults.nr.temporalSmoothing == 0.0f);
-  REQUIRE(defaults.nr.temporalSpatial == false);
   // Retired keys read silently.
   std::vector<std::string> retiredWarnings;
-  ParseConfig("[nr]\nevaluate_every = 2\ntemporal_reproject = true\n", retiredWarnings);
+  ParseConfig("[nr]\nevaluate_every = 2\ntemporal_reproject = true\n"
+              "motion_vectors = false\nmodel_temporal = false\n"
+              "temporal_smoothing = 0.6\ntemporal_spatial = true\n",
+              retiredWarnings);
   REQUIRE(retiredWarnings.empty());
   REQUIRE(defaults.nr.modelScale == 1.0f);
   REQUIRE(defaults.nr.finalPassFull == false);

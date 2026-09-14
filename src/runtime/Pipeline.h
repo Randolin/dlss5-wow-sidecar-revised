@@ -190,17 +190,31 @@ class Pipeline {
   // difference the pass made. Stalls the GPU for one frame; only on request.
   void DumpDebugFrames();
 
-  // Render thread. Copies one of the pipeline's textures to the CPU as 8-bit
-  // BGR, top row first. Stalls the GPU; only for diagnostics and calibration.
+  // What a motion dump found, in pixels of displacement per frame. Filled by
+  // ReadbackBgr when it renders a motion field; the dump logs it, because the
+  // numbers say more than the picture does.
+  struct MotionFieldStats {
+    float medianPx = 0.0f;
+    float p95Px = 0.0f;
+    float maxPx = 0.0f;
+    // What full colour means in the written BMP. Chosen from the frame's own
+    // p95 so the picture is legible whatever the turn rate; it is therefore
+    // NOT comparable between dumps without reading this number.
+    float fullScalePx = 0.0f;
+  };
+
   // Render thread. Copies one of the pipeline's textures to the CPU as 8-bit
   // BGR, top row first, at the texture's own size (reported through outWidth
   // and outHeight). Float formats are converted per channel with `scale` and
   // `bias` applied first, so a gain map can be written as mid-grey-is-one.
+  // `motionNdc` instead reads an RG16F NDC motion field and renders it as a
+  // legible picture, auto-scaled, reporting what it found through `outMotion`.
   // Stalls the GPU; only for diagnostics and calibration.
   std::vector<uint8_t> ReadbackBgr(ID3D12Resource* texture, D3D12_RESOURCE_STATES restState,
-                                   bool rgba16f, bool scRgb = false, uint32_t* outWidth = nullptr,
+                                   bool rgba16f, bool scRgb = false, bool motionNdc = false,
+                                   uint32_t* outWidth = nullptr,
                                    uint32_t* outHeight = nullptr, float scale = 1.0f,
-                                   float bias = 0.0f);
+                                   float bias = 0.0f, MotionFieldStats* outMotion = nullptr);
 
   // Render thread, after a present. Performs the requested calibration step.
   void CalibrationCapture(int step);
@@ -320,6 +334,9 @@ class Pipeline {
   std::atomic<bool> rebuildRequested_{false};
   std::atomic<bool> targetLost_{false};
   std::atomic<bool> dumpRequested_{false};
+  // The number the next dump's filenames carry, so repeated dumps sit beside
+  // each other instead of overwriting. Render thread only.
+  uint32_t dumpIndex_ = 0;
   // Set while the overlay is not on screen; the render thread idles.
   std::atomic<bool> paused_{false};
   std::atomic<int> calibrationRequest_{0};

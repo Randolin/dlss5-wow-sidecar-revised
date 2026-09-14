@@ -31,11 +31,6 @@ struct NrBridgeParams {
   // A/B split: fraction of the frame's width, from the left, left untouched.
   // 0 is off.
   float split = 0.0f;
-  // Temporal stabilisation of the model's edit (gpu/NrTemporal.h). 0 is off
-  // and costs nothing: no history textures, no pass. Above 0, the history
-  // weight for a darkening edit; brightening uses half of it.
-  float temporalSmoothing = 0.0f;
-  bool temporalSpatial = true;
 };
 
 // The compute passes around the model. Every pass samples its sources and

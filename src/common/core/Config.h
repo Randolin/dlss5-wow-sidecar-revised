@@ -51,12 +51,6 @@ struct NrSettings {
   float paperWhiteNits = 0.0f;
   float colourPreserve = 1.0f;     // 0 the model's colour .. 1 the original's
   float highlightProtect = 0.6f;   // 0 pure composition .. 1 no brightening near white
-  // Temporal stabilisation of the model's edit. 0 is off and costs nothing --
-  // no history textures, no pass. Above 0 it is the history weight.
-  float temporalSmoothing = 0.0f;
-  // The 3x3 guided blur of the edit before blending. Off by default: it also
-  // blurs the model's local structure, which is high-frequency gain.
-  bool temporalSpatial = false;
   // The model works at this fraction of the capture resolution. 1.0 is full;
   // 0.75 costs a little over half as much.
   float modelScale = 1.0f;
@@ -77,6 +71,17 @@ struct NrSettings {
   // untouched. 0 is off, 0.5 splits down the middle. A thin line marks the
   // seam. Costs nothing when off -- it is a constant in the compose.
   float splitView = 0.0f;
+
+  // What the model is told about motion.
+  //
+  // Not settings: the runtime refuses to evaluate without a motion field, and
+  // its reset flag has no observable effect, so both were tried and removed.
+  // Nor is there a stabiliser here any more. One was built to steady the
+  // model's edit, and it was only ever compensating for motion vectors that
+  // were negated on the way in (flow/MotionVectorMath.h). With the sign
+  // corrected the model's own temporal handling is steady, and the stabiliser
+  // and its two settings were removed rather than left as dials that do
+  // nothing useful.
 
   // The passes that will actually run: `passes`, or one pass of `base`.
   std::vector<NrPassSettings> Effective() const {
@@ -139,8 +144,8 @@ struct Config {
 
   // Whether the manager shows the settings that are rarely touched: the
   // pipeline internals, the model's preset slot, the mask's own switches,
-  // chaining, per-pass tuning, temporal stabilisation. Off by default; a
-  // manager preference, not something the runtime reads.
+  // chaining, per-pass tuning. Off by default; a manager preference, not
+  // something the runtime reads.
   bool advancedTuning = false;
 
   TargetAppSettings app;

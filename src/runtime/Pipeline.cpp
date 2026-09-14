@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <utility>
 
 #include "capture/WgcSource.h"
 #include "core/ImageDump.h"
@@ -93,6 +94,27 @@ ComPtr<ID3D12Resource> CreateWorkTarget(ID3D12Device* dev, uint32_t w, uint32_t 
                                D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
                                IID_PPV_ARGS(&tex));
   return tex;
+}
+
+// The first dump number not already on disk, starting the search at `from`.
+// Probing rather than counting from zero means a dump taken in an earlier
+// session is not silently overwritten by the first dump of this one.
+uint32_t NextDumpIndex(const std::filesystem::path& dir, uint32_t from,
+                       const std::vector<const char*>& names) {
+  std::error_code ec;
+  for (uint32_t n = from; n < 1000; ++n) {
+    char suffix[16];
+    std::snprintf(suffix, sizeof(suffix), "_%03u.bmp", n);
+    bool taken = false;
+    for (const char* name : names) {
+      if (std::filesystem::exists(dir / (std::string(name) + suffix), ec)) {
+        taken = true;
+        break;
+      }
+    }
+    if (!taken) return n;
+  }
+  return 999;   // a thousand dumps in one folder is the operator's problem
 }
 
 }  // namespace
@@ -412,8 +434,9 @@ void Pipeline::ApplyVisibility() {
 
 std::vector<uint8_t> Pipeline::ReadbackBgr(ID3D12Resource* texture,
                                            D3D12_RESOURCE_STATES restState, bool rgba16f,
-                                           bool scRgb, uint32_t* outWidth, uint32_t* outHeight,
-                                           float scale, float bias) {
+                                           bool scRgb, bool motionNdc, uint32_t* outWidth,
+                                           uint32_t* outHeight, float scale, float bias,
+                                           MotionFieldStats* outMotion) {
   std::vector<uint8_t> bgr;
   if (!texture || !dev_.bridge) return bgr;
   auto* device = dev_.bridge->D3d12();
@@ -480,6 +503,80 @@ std::vector<uint8_t> Pipeline::ReadbackBgr(ID3D12Resource* texture,
   D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
   if (FAILED(buffer->Map(0, &range, &mapped)) || !mapped) return bgr;
   bgr.resize(static_cast<size_t>(w) * h * 3);
+
+  if (motionNdc) {
+    // The motion field, made legible and measured. Vectors are NDC, so they
+    // scale back to pixels by the frame's own extent.
+    //
+    // Two passes. The first bins every displacement magnitude, because a fixed
+    // full-scale is useless here: a slow pan and a fast whip differ by more
+    // than an order of magnitude, and one constant either flattens the slow
+    // case to grey or pins the fast one at the channel ends -- which destroys
+    // exactly the direction information the picture exists to show. The second
+    // renders against the frame's own 95th percentile.
+    //
+    // Red is horizontal and green vertical, both mid-grey at zero, so coherent
+    // camera motion reads as one flat colour across everything it moves. Blue
+    // is magnitude, black at rest: the channel to read first, because anywhere
+    // the estimator found nothing to track stays black however the scene is
+    // actually moving.
+    constexpr int kBuckets = 2048;
+    constexpr float kBucketPx = 0.25f;   // 512 px of range, finely enough binned
+    std::vector<uint32_t> histogram(kBuckets, 0);
+    float maxPx = 0.0f;
+    const auto readVector = [&](const uint8_t* row, uint32_t x) {
+      const auto* p = reinterpret_cast<const uint16_t*>(row) + static_cast<size_t>(x) * halves;
+      return std::pair<float, float>{HalfToFloat(p[0]) * static_cast<float>(w),
+                                     HalfToFloat(p[1]) * static_cast<float>(h)};
+    };
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint8_t* row = static_cast<const uint8_t*>(mapped) + footprint.Offset +
+                           static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+      for (uint32_t x = 0; x < w; ++x) {
+        const auto [mx, my] = readVector(row, x);
+        const float mag = std::sqrt(mx * mx + my * my);
+        maxPx = std::max(maxPx, mag);
+        const int bucket = std::min(static_cast<int>(mag / kBucketPx), kBuckets - 1);
+        ++histogram[static_cast<size_t>(bucket)];
+      }
+    }
+    const uint64_t total = static_cast<uint64_t>(w) * h;
+    const auto percentile = [&](double fraction) {
+      const uint64_t target = static_cast<uint64_t>(fraction * static_cast<double>(total));
+      uint64_t seen = 0;
+      for (int i = 0; i < kBuckets; ++i) {
+        seen += histogram[static_cast<size_t>(i)];
+        if (seen >= target) return (static_cast<float>(i) + 0.5f) * kBucketPx;
+      }
+      return static_cast<float>(kBuckets) * kBucketPx;
+    };
+    MotionFieldStats stats;
+    stats.medianPx = percentile(0.50);
+    stats.p95Px = percentile(0.95);
+    stats.maxPx = maxPx;
+    // A floor, so a still scene does not amplify sensor noise into a light show.
+    stats.fullScalePx = std::max(stats.p95Px, 1.0f);
+    if (outMotion) *outMotion = stats;
+
+    const auto to8 = [](float v) {
+      v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+      return static_cast<uint8_t>(v * 255.0f + 0.5f);
+    };
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint8_t* row = static_cast<const uint8_t*>(mapped) + footprint.Offset +
+                           static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+      for (uint32_t x = 0; x < w; ++x) {
+        const auto [mx, my] = readVector(row, x);
+        uint8_t* px = bgr.data() + (static_cast<size_t>(y) * w + x) * 3;
+        px[2] = to8(0.5f + 0.5f * mx / stats.fullScalePx);
+        px[1] = to8(0.5f + 0.5f * my / stats.fullScalePx);
+        px[0] = to8(std::sqrt(mx * mx + my * my) / stats.fullScalePx);
+      }
+    }
+    D3D12_RANGE noneMotion{0, 0};
+    buffer->Unmap(0, &noneMotion);
+    return bgr;
+  }
   for (uint32_t y = 0; y < h; ++y) {
     const uint8_t* row = static_cast<const uint8_t*>(mapped) + footprint.Offset +
                          static_cast<size_t>(y) * footprint.Footprint.RowPitch;
@@ -534,32 +631,75 @@ void Pipeline::DumpDebugFrames() {
     D3D12_RESOURCE_STATES rest;
     bool half;
     bool scRgb;
+    bool motion;
   };
   const Item items[] = {
-      {"nr_input", dev_.normalized.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, false},
+      {"nr_input", dev_.normalized.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, false,
+       false},
       // With the resolve folded in, the composed result *is* the work target.
       {"nr_output",
        dev_.directResolve ? dev_.workTarget.Get() : dev_.neuralTarget.Get(),
        dev_.directResolve ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-       !dev_.directResolve, false},
+       !dev_.directResolve, false, false},
+      // What the model was told about motion. Estimated from colour, so it is
+      // only as good as the texture it had to track -- which is the whole
+      // question on a smooth surface.
+      {"motion", dev_.motionTarget.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, false,
+       true},
       // In HDR the presented frame is scRGB; it is previewed through the same
       // tone curve the model's view uses so the BMP is comparable.
-      {"presented", dev_.workTarget.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, dev_.hdr, dev_.hdr},
+      {"presented", dev_.workTarget.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, dev_.hdr, dev_.hdr,
+       false},
   };
+
+  // A number per dump, shared by every image in it, so one press produces a
+  // matched set and the next press does not overwrite it.
+  std::vector<const char*> names;
+  for (const auto& item : items) names.push_back(item.name);
+  dumpIndex_ = NextDumpIndex(config_.runtimeDir, dumpIndex_, names);
+  char suffix[16];
+  std::snprintf(suffix, sizeof(suffix), "_%03u.bmp", dumpIndex_);
+  ++dumpIndex_;
+
   std::vector<std::vector<uint8_t>> images;
+  MotionFieldStats motionStats;
+  bool haveMotionStats = false;
   for (const auto& item : items) {
     if (!item.tex) {
       images.emplace_back();
       continue;
     }
-    images.push_back(ReadbackBgr(item.tex, item.rest, item.half, item.scRgb));
+    images.push_back(ReadbackBgr(item.tex, item.rest, item.half, item.scRgb, item.motion,
+                                 nullptr, nullptr, 1.0f, 0.0f,
+                                 item.motion ? &motionStats : nullptr));
+    if (item.motion && !images.back().empty()) haveMotionStats = true;
     if (images.back().empty()) continue;
-    const auto path = config_.runtimeDir / (std::string(item.name) + ".bmp");
+    const auto path = config_.runtimeDir / (std::string(item.name) + suffix);
     if (WriteBmp(path, w, h, images.back())) {
       GlobalLog().Info(std::string("debug dump: wrote ") + path.filename().string());
     } else {
       GlobalLog().Error(std::string("debug dump: could not write ") + path.string());
     }
+  }
+
+  // The motion field is only meaningful once flow has run on two frames. Said
+  // plainly, because an all-black motion dump has two very different causes
+  // and only one of them is interesting.
+  if (!dev_.flow || !dev_.flow->Available()) {
+    GlobalLog().Warn("debug dump: optical flow is unavailable this session, so motion.bmp "
+                     "is a zero field -- that is the estimator missing, not the scene "
+                     "standing still.");
+  } else if (haveMotionStats) {
+    // The numbers matter more than the picture: the BMP is scaled to this
+    // frame's own 95th percentile, so its colours mean something different in
+    // every dump and cannot be compared without them.
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "debug dump: motion field median %.1f px/frame, p95 %.1f, max %.1f; "
+                  "full colour in the BMP is %.1f px",
+                  motionStats.medianPx, motionStats.p95Px, motionStats.maxPx,
+                  motionStats.fullScalePx);
+    GlobalLog().Info(line);
   }
 
   // How much the pass changed the picture: mean absolute difference per
@@ -1327,7 +1467,6 @@ void Pipeline::RenderLoop() {
       model.width = dev_.bridge->Width();
       model.height = dev_.bridge->Height();
       model.hdr = dev_.hdr;
-      model.temporal = config_.nr.temporalSmoothing > 0.0f;
       if (auto* direct = dynamic_cast<DirectNrPass*>(dev_.pass.get())) {
         model.modelWidth = direct->WorkWidth();
         model.modelHeight = direct->WorkHeight();

@@ -29,7 +29,6 @@ struct HudModel {
   uint32_t modelWidth = 0;    // 0 when no model is running
   uint32_t modelHeight = 0;
   int passCount = 0;
-  bool temporal = false;
   bool hdr = false;
 
   // The last presented intervals, milliseconds, oldest first. A graph of these

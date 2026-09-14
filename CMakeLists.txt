@@ -66,7 +66,6 @@ compile_compute_shader(UiMaskBlend)
 compile_compute_shader(NrEncode)
 compile_compute_shader(NrResolve)
 compile_compute_shader(NrCompose)
-compile_compute_shader(NrTemporal)
 compile_compute_shader(HdrToSdr)
 compile_compute_shader(HdrCompose)
 
@@ -93,7 +92,6 @@ target_sources(sidecar_common PRIVATE
   src/common/gpu/Luminance.cpp
   src/common/gpu/UiMask.cpp
   src/common/gpu/NrColorBridge.cpp
-  src/common/gpu/NrTemporal.cpp
   src/common/gpu/HdrBridge.cpp
   src/common/flow/NvofaFlow.cpp
   src/common/flow/FlowToMotionVec.cpp

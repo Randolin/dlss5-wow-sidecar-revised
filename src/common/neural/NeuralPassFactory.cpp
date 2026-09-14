@@ -33,8 +33,6 @@ NrBridgeParams BridgeFromSettings(const NrSettings& nr) {
   b.colourPreserve = nr.colourPreserve;
   b.highlightProtect = nr.highlightProtect;
   b.split = nr.splitView;
-  b.temporalSmoothing = nr.temporalSmoothing;
-  b.temporalSpatial = nr.temporalSpatial;
   return b;
 }
 
