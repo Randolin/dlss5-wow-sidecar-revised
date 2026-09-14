@@ -42,6 +42,18 @@ class DCompOverlay {
   void Hide() noexcept;
   bool IsVisible() const { return visible_; }
 
+  // Configure mode. On: the window drops WS_EX_TRANSPARENT and
+  // WS_EX_NOACTIVATE, answers hit tests as its own client area, and takes the
+  // foreground -- so mouse and keyboard reach this process, which is what the
+  // ReShade UI hosted inside it needs. Off: click-through and non-activating
+  // again, exactly as created. Call from the thread that owns the window.
+  //
+  // The caller's process must hold foreground rights for the SetForegroundWindow
+  // inside to succeed; the manager grants them with AllowSetForegroundWindow
+  // before it sends the command.
+  void SetInteractive(bool on);
+  bool IsInteractive() const { return interactive_; }
+
   // Copies frame into the back buffer and presents. waitFenceValue is the
   // DeviceBridge shared-fence value the queue must wait on first.
   void Present(ID3D12Resource* frame, uint64_t waitFenceValue);
@@ -66,6 +78,7 @@ class DCompOverlay {
   uint32_t width_ = 0;
   uint32_t height_ = 0;
   bool visible_ = false;
+  bool interactive_ = false;
 
   Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain_;
   Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;

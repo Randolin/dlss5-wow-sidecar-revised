@@ -29,6 +29,23 @@ enum class SidecarCommand : uint32_t {
   HideOverlay = 3,
   ShowHud = 4,
   HideHud = 5,
+  // Configure mode: the overlay temporarily takes focus and hit-testing so the
+  // ReShade UI hosted inside the runtime can be driven with the mouse and
+  // keyboard. While it is on, clicks stop at the overlay instead of reaching
+  // the game -- which is the point, and why it must be explicit and reversible.
+  EnterConfigMode = 6,
+  ExitConfigMode = 7,
+  // Writes the textures either side of the neural pass to disk as BMPs beside
+  // the sidecar, and logs how much the pass changed the frame. The one honest
+  // way to tell "the model is doing little" from "the model's work is being
+  // thrown away on the way to the screen".
+  DumpDebugFrames = 8,
+  CalibrateUiWithInterface = 9,
+  CalibrateUiWithoutInterface = 10,
+  // The manager saved sidecar.toml; re-read it and apply what can be applied
+  // to the running overlay -- compose parameters on the next frame, pass
+  // setups by hot-swapping features -- and rebuild for anything else.
+  ReloadSettings = 11,
 };
 
 // What the manager displays while the overlay runs. Plain old data with fixed
@@ -39,6 +56,19 @@ struct SidecarStatus {
   uint32_t processId = 0;
   uint32_t overlayVisible = 0;
   uint32_t hudVisible = 0;
+  // Non-zero while the overlay is in configure mode (see EnterConfigMode).
+  uint32_t overlayInteractive = 0;
+  // UI calibration: 0 idle, 1 first capture taken, 2 done. calibrationRects is
+  // the count found by the last completed calibration.
+  uint32_t calibrationStep = 0;
+  uint32_t calibrationRects = 0;
+  // The preset the runtime last applied, by name -- from the config at launch,
+  // or from a hotkey since. The manager mirrors it so a hotkey change is saved.
+  char activePreset[64] = {};
+  // Which global hotkeys the runtime managed to register, as bits: 1 toggle
+  // HUD, 2 toggle overlay, 4 next preset, 8 previous preset. A bit clear means
+  // the binding did not parse or another program owns the combination.
+  uint32_t hotkeysRegistered = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   double p50Ms = 0.0;
@@ -70,10 +100,12 @@ struct SidecarStatus {
   // neural pass unless you are told.
   uint32_t vramUsedMb = 0;
   uint32_t vramBudgetMb = 0;
-  // Video memory pushed out to system RAM. Non-zero means the card is full and
-  // frames are waiting on PCIe. This is the alarm worth watching; the budget
-  // above stays generous until contention actually bites.
+  // Local usage past the local budget: the card is full and frames are waiting
+  // on PCIe. Zero is the normal state.
   uint32_t vramSpilledMb = 0;
+  // System memory held through the driver -- upload and readback heaps, the
+  // runtimes' staging. Informational; a hundred megabytes of it is normal.
+  uint32_t vramSystemMb = 0;
   char passName[64] = {};
   char runtimeVariant[64] = {};
   char lastError[256] = {};

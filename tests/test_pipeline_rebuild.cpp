@@ -72,6 +72,10 @@ TEST_CASE("rebuilding produces a pipeline that presents again", "[device]") {
   auto pipeline = Pipeline::Create(*gpu, cfg, PassthroughPass::Create());
   REQUIRE(pipeline != nullptr);
   pipeline->Start();
+  // The overlay only shows while the target has the foreground. Under a test
+  // runner nothing guarantees the pattern window does, so say so explicitly,
+  // as the foreground watcher would.
+  pipeline->OnForegroundChanged(app.hwnd);
   PumpFor(600ms);
   REQUIRE(pipeline->Running());
   REQUIRE(pipeline->Stats().Count() > 0);
@@ -80,6 +84,7 @@ TEST_CASE("rebuilding produces a pipeline that presents again", "[device]") {
   REQUIRE(GetWindowRect(pipeline->OverlayHwnd(), &boundsBefore));
 
   REQUIRE(pipeline->RebuildAndRestart());
+  pipeline->OnForegroundChanged(app.hwnd);
   PumpFor(1200ms);
 
   const HWND overlayAfter = pipeline->OverlayHwnd();
@@ -102,6 +107,7 @@ TEST_CASE("rebuilding produces a pipeline that presents again", "[device]") {
 
   // And a second rebuild works, so nothing is left in a one-shot state.
   REQUIRE(pipeline->RebuildAndRestart());
+  pipeline->OnForegroundChanged(app.hwnd);
   PumpFor(1200ms);
   REQUIRE(pipeline->Running());
   REQUIRE(IsWindowVisible(pipeline->OverlayHwnd()));
@@ -136,6 +142,7 @@ TEST_CASE("device loss is handed to the owner thread and hides the overlay", "[d
   auto pipeline = Pipeline::Create(*gpu, cfg, PassthroughPass::Create());
   REQUIRE(pipeline != nullptr);
   pipeline->Start();
+  pipeline->OnForegroundChanged(app.hwnd);
   PumpFor(600ms);
   REQUIRE(pipeline->Running());
   REQUIRE(pipeline->NeedsRebuild() == false);

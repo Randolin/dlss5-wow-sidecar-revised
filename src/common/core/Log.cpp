@@ -1,5 +1,9 @@
 #include "core/Log.h"
 
+#include <cstdio>
+#include <ctime>
+#include <system_error>
+
 namespace sidecar {
 namespace {
 
@@ -11,11 +15,35 @@ const char* LevelName(LogLevel level) {
   }
 }
 
+// Wall clock, once, in the header line. Everything after it is relative.
+std::string NowText() {
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  localtime_s(&tm, &now);
+  char buffer[32];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm);
+  return buffer;
+}
+
 }  // namespace
 
 bool Log::OpenFile(const std::filesystem::path& path) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // Keep the last run. Without this a crash's log is destroyed by the relaunch
+  // that goes looking for it.
+  std::error_code ec;
+  if (std::filesystem::exists(path, ec) && !ec) {
+    std::filesystem::path previous = path;
+    previous += ".prev";
+    std::filesystem::remove(previous, ec);
+    std::filesystem::rename(path, previous, ec);
+  }
   file_.open(path, std::ios::out | std::ios::trunc);
+  opened_ = std::chrono::steady_clock::now();
+  if (file_.is_open()) {
+    file_ << "=== " << NowText() << " -- times below are milliseconds since this line\n";
+    file_.flush();
+  }
   return file_.is_open();
 }
 
@@ -29,7 +57,16 @@ void Log::Write(LogLevel level, std::string_view message) {
   if (level < minimum_) return;
 
   std::string line;
-  line.reserve(message.size() + 8);
+  line.reserve(message.size() + 24);
+  {
+    // Seconds to three decimals: long enough to read at a glance, precise
+    // enough to see that two lines were one frame apart.
+    const auto ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - opened_).count();
+    char stamp[24];
+    std::snprintf(stamp, sizeof(stamp), "[%9.3f] ", ms / 1000.0);
+    line += stamp;
+  }
   line += LevelName(level);
   line += ": ";
   line.append(message);

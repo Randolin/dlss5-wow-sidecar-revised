@@ -16,7 +16,8 @@ add_executable(sidecar_tests
   test_nvofa_flow.cpp
   test_motion_vector_math.cpp
   test_config.cpp
-  test_addon_settings.cpp
+  test_presets.cpp
+  test_hotkeys.cpp
   test_install.cpp
   test_log.cpp
   test_sha256.cpp
@@ -24,10 +25,10 @@ add_executable(sidecar_tests
   test_ngx_session.cpp
   test_mask_math.cpp
   test_ui_mask.cpp
-  test_reshade_hosted_pass.cpp
   test_probes.cpp
   test_neural_pass_factory.cpp
   test_panic_switch.cpp
+  test_ui_calibration.cpp
   ../src/manager/Install.cpp
   ../src/manager/Probes.cpp
   ../src/runtime/Pipeline.cpp

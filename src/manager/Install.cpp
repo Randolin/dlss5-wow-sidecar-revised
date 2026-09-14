@@ -20,14 +20,16 @@ std::string Lower(std::string_view text) {
 // leaving a stale config and two logs behind after "remove everything" is the
 // kind of tidiness failure that makes people delete the whole folder by hand.
 constexpr std::string_view kGeneratedFiles[] = {
-    "sidecar.toml", "sidecar.log", "sidecar-manager.log", "ReShade.ini", "ReShade.log",
+    "sidecar.toml", "presets.toml", "sidecar.log", "sidecar-manager.log",
+    "ui_mask_calibration.toml", "ui_mask_diff.bmp",
+    "nr_input.bmp", "nr_output.bmp", "presented.bmp",
 };
 
 }  // namespace
 
 const std::vector<Component>& Components() {
-  // Ordered by what a first-time operator has to do first: without the runtime
-  // there is nothing to host, and without ReShade there is nothing to host it.
+  // Two operator-supplied files. The forwarder the runtime is called through
+  // is built with the sidecar and is not the operator's to fetch.
   static const std::vector<Component> components = {
       {"nvngx_dlssnr.dll",
        "DLSS 5 neural rendering runtime",
@@ -37,27 +39,14 @@ const std::vector<Component>& Components() {
        "nvngx_dlssnr.dll",
        "github.com/rakanki911/DLSS5-Swapper releases",
        true},
-      {"dxgi.dll",
-       "ReShade, with add-on support",
-       "Hosts the add-on inside the sidecar's own process. The add-on-enabled "
-       "build is required; the plain one loads no add-ons at all.",
-       "dxgi.dll,reshade64.dll,d3d11.dll",
-       "reshade.me -- take the version WITH full add-on support",
-       true},
-      {"renodx-dlss5.addon64",
-       "RenoDX DLSS 5 add-on",
-       "Detours the sidecar's own NGX calls and substitutes neural-rendered "
-       "output. This is what makes the pass neural rather than a plain DLAA.",
-       "renodx-dlss5.addon64",
-       "github.com/renodx-dev -- the DLSS 5 Generic add-on",
-       true},
       {"nvngx_dlss.dll",
        "DLSS upscaling runtime",
-       "Optional. Only consulted if the add-on's work-in-progress upscaling "
-       "path is switched on; neural rendering itself does not need it.",
+       "The neural-rendering runtime builds a DLSS feature of its own for its "
+       "temporal pass, so this has to be beside it even though the sidecar never "
+       "creates one directly.",
        "nvngx_dlss.dll",
-       "github.com/rakanki911/DLSS5-Swapper releases",
-       false},
+       "github.com/rakanki911/DLSS5-Swapper releases, or any game shipping DLSS",
+       true},
   };
   return components;
 }
@@ -88,6 +77,33 @@ size_t ComponentForFile(std::string_view fileName) {
   return static_cast<size_t>(-1);
 }
 
+std::vector<std::string> AcceptedNames(const Component& component) {
+  std::vector<std::string> names;
+  const std::string accepts = Lower(component.accepts);
+  size_t start = 0;
+  while (start <= accepts.size()) {
+    const size_t comma = accepts.find(',', start);
+    const size_t end = comma == std::string::npos ? accepts.size() : comma;
+    if (end > start) names.push_back(accepts.substr(start, end - start));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return names;
+}
+
+std::vector<fs::path> InstalledFiles(const Component& component, const fs::path& sidecarDir) {
+  // Checked by name rather than by listing the directory: this runs every
+  // frame on the manager's Setup page, and a couple of exists() calls are
+  // cheaper than enumerating a folder that also holds a 160 MB runtime.
+  std::vector<fs::path> found;
+  std::error_code ec;
+  for (const auto& name : AcceptedNames(component)) {
+    const fs::path candidate = sidecarDir / name;
+    if (fs::exists(candidate, ec) && !ec) found.push_back(candidate);
+  }
+  return found;
+}
+
 InstallResult InstallComponent(const Component& component, const fs::path& source,
                                const fs::path& sidecarDir) {
   std::error_code ec;
@@ -110,21 +126,20 @@ InstallResult InstallComponent(const Component& component, const fs::path& sourc
   if (ec) {
     return {false, "Could not copy it in: " + ec.message()};
   }
-  return {true, "Installed " + std::string(component.installedAs) + "."};
+  return {true, "Installed " + destination.filename().string() + "."};
 }
 
 std::vector<fs::path> UninstallPlan(const fs::path& sidecarDir, bool includeGeneratedFiles) {
   std::vector<fs::path> plan;
   std::error_code ec;
-
-  const auto add = [&](std::string_view name) {
-    const fs::path path = sidecarDir / std::string(name);
-    if (fs::exists(path, ec) && !ec) plan.push_back(path);
-  };
-
-  for (const auto& component : Components()) add(component.installedAs);
+  for (const auto& component : Components()) {
+    for (const auto& file : InstalledFiles(component, sidecarDir)) plan.push_back(file);
+  }
   if (includeGeneratedFiles) {
-    for (const auto& name : kGeneratedFiles) add(name);
+    for (const auto& name : kGeneratedFiles) {
+      const fs::path path = sidecarDir / std::string(name);
+      if (fs::exists(path, ec) && !ec) plan.push_back(path);
+    }
   }
   return plan;
 }

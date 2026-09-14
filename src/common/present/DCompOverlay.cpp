@@ -19,7 +19,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   // what actually excludes the overlay from the game's hit test is
   // WS_EX_LAYERED | WS_EX_TRANSPARENT, set at creation. This stays because it
   // costs nothing and is right for anything asking from our own thread.
-  if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+  //
+  // In configure mode the window has to own its client area instead, or the
+  // clicks the operator aims at the ReShade UI fall through it.
+  if (msg == WM_NCHITTEST) {
+    auto* self = reinterpret_cast<DCompOverlay*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (self && self->IsInteractive()) return HTCLIENT;
+    return HTTRANSPARENT;
+  }
   return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -67,6 +74,7 @@ std::unique_ptr<DCompOverlay> DCompOverlay::Create(DeviceBridge& bridge,
       0, 0, static_cast<int>(width), static_cast<int>(height),
       nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
   if (!o->hwnd_) return nullptr;
+  SetWindowLongPtrW(o->hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(o.get()));
 
   // Fully opaque. DirectComposition does the compositing, so this changes no
   // pixels -- but a layered window with no attributes set is never composed at
@@ -79,7 +87,12 @@ std::unique_ptr<DCompOverlay> DCompOverlay::Create(DeviceBridge& bridge,
   DXGI_SWAP_CHAIN_DESC1 scd{};
   scd.Width = width;
   scd.Height = height;
-  scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  // The swapchain is in the ring's format. On an HDR desktop that is FP16,
+  // and the colour space set below tells DWM it is scRGB, so it is composed as
+  // HDR beside the game rather than treated as SDR content and lifted or
+  // dimmed to the desktop's SDR white level.
+  const bool hdr = bridge.RingFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  scd.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
   scd.SampleDesc.Count = 1;
   scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
   // Three buffers and a latency of two, not two and one.
@@ -102,6 +115,11 @@ std::unique_ptr<DCompOverlay> DCompOverlay::Create(DeviceBridge& bridge,
   if (FAILED(sc1.As(&o->swapChain_))) return nullptr;
   o->swapChain_->SetMaximumFrameLatency(2);
   o->frameLatencyWaitable_ = o->swapChain_->GetFrameLatencyWaitableObject();
+  if (hdr) {
+    // scRGB: linear, 1.0 = 80 nits, unbounded. The only colour space an FP16
+    // composition swapchain is composed as HDR in.
+    o->swapChain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+  }
 
   if (FAILED(DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&o->dcompDevice_)))) return nullptr;
   if (FAILED(o->dcompDevice_->CreateTargetForHwnd(o->hwnd_, TRUE, &o->dcompTarget_))) return nullptr;
@@ -141,6 +159,31 @@ void DCompOverlay::SetBounds(const RECT& screenRect) {
 void DCompOverlay::Show() {
   ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
   visible_ = true;
+}
+
+void DCompOverlay::SetInteractive(bool on) {
+  if (!hwnd_ || interactive_ == on) return;
+  interactive_ = on;
+
+  // Only the two bits that make the window click-through and unfocusable
+  // change. WS_EX_LAYERED stays: it is what lets the DirectComposition visual
+  // show through at all (see Create), and removing it would blank the overlay.
+  constexpr LONG_PTR kPassThrough = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+  LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+  ex = on ? (ex & ~kPassThrough) : (ex | kPassThrough);
+  SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
+  // Extended-style changes are not honoured until the frame is recomputed.
+  SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED |
+                   (on ? 0u : SWP_NOACTIVATE));
+
+  if (on) {
+    // Take the keyboard. This only succeeds because the manager, which owned
+    // the foreground when the operator clicked, granted this process the right
+    // first -- the same handshake the runtime uses to hand focus to the game.
+    SetForegroundWindow(hwnd_);
+    SetFocus(hwnd_);
+  }
 }
 
 void DCompOverlay::Hide() noexcept {

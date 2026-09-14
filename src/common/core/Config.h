@@ -4,13 +4,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sidecar {
 
-// A screen-space rectangle the neural pass should leave alone. WoW's UI is
-// drawn into the same frame the sidecar captures, so masking it out is the
-// only way to keep text and icons from being reprocessed.
 struct UiRect {
   int32_t left = 0;
   int32_t top = 0;
@@ -18,34 +16,96 @@ struct UiRect {
   int32_t bottom = 0;
 };
 
-// The knobs the RenoDX DLSS 5 add-on reads out of ReShade.ini's
-// [RenoDX.DLSS5] section.
-//
-// These are not our settings. We carry them from the manager's UI to the file
-// the add-on reads, and the add-on is the authority on what any of them mean.
-// The names here are the add-on's own key names, taken from its binary, so a
-// reader can grep for them in both places.
-struct NeuralSettings {
-  // 0 = every hook off (no neural rendering at all), 1 = NGX plus Streamline,
-  // 2 = NGX only. Two is what this sidecar wants: we make the NGX calls
-  // ourselves and there is no Streamline in the process to contest.
-  int enableHooks = 2;
+// The direct neural-rendering path's tuning: the model's own knobs, as the
+// runtime names them. One set applies to every pass unless a pass overrides
+// it. Ranges are the model's: preset 0-3 (0 lets the model choose), style 0
+// standard / 1 natural / 2 cinematic, strengths 0-2, skin structure -1 for off.
+struct NrPassSettings {
+  int preset = 0;
+  int style = 0;
+  float intensity = 1.0f;
+  float localStructure = 1.0f;
+  float localTone = 1.0f;
+  float skinStructure = -1.0f;
+  bool autoMask = true;
+  bool uiCorrection = true;
+};
 
-  float intensity = 1.0f;          // NRIntensity
-  float colorStrength = 1.0f;      // NRColorStrength
-  float transferStrength = 1.0f;   // NRTransferStrength
-  float paperWhiteScale = 1.0f;    // NRPaperWhiteScale
-  int preset = 0;                  // NRPreset, the add-on's own #1..#3
-  int style = 0;                   // NRStyle
-  bool upscaling = false;          // NREnableUpscaling; the add-on marks it WIP
+struct NrSettings {
+  NrPassSettings base;
+  // Per-pass overrides, in order. Empty means one pass at `base`. Each entry
+  // starts as a copy of base and takes only the keys it names, so a file can
+  // say "three passes, the last one softer" without restating everything.
+  std::vector<NrPassSettings> passes;
 
-  // The add-on exposes these but does not print them in its status line, so we
-  // do not know its defaults and will not invent them. Negative means "leave it
-  // alone": the key is omitted from the file entirely rather than pinned to a
-  // number we guessed.
-  float localStructure = -1.0f;    // NRLocalStructure
-  float localTone = -1.0f;         // NRLocalTone
-  float skinStructure = -1.0f;     // NRSkinStructure
+  // How the model's answer is composed back into the frame (gpu/NrColorBridge).
+  // Whole-frame settings, not per pass.
+  //
+  // The bridge is the retired SDR-side experiment and is off by default.
+  // Headroom is no longer a setting: the tone-map is identity below paper
+  // white, so spanning the display's full range costs SDR content nothing and
+  // is always right for HDR content. The runtime derives it.
+  bool bridge = false;
+  // 0 means automatic: the display's own SDR white level, which is what an SDR
+  // game on an HDR desktop is composed at. A number overrides it.
+  float paperWhiteNits = 0.0f;
+  float colourPreserve = 1.0f;     // 0 the model's colour .. 1 the original's
+  float highlightProtect = 0.6f;   // 0 pure composition .. 1 no brightening near white
+  // Temporal stabilisation of the model's edit. 0 is off and costs nothing --
+  // no history textures, no pass. Above 0 it is the history weight.
+  float temporalSmoothing = 0.0f;
+  // The 3x3 guided blur of the edit before blending. Off by default: it also
+  // blurs the model's local structure, which is high-frequency gain.
+  bool temporalSpatial = false;
+  // The model works at this fraction of the capture resolution. 1.0 is full;
+  // 0.75 costs a little over half as much.
+  float modelScale = 1.0f;
+  // Run the last pass at full resolution while the earlier passes work at
+  // modelScale. Lighting from the cheap passes, fine structure from the
+  // expensive one; needs two or more passes to mean anything.
+  bool finalPassFull = false;
+  // With more than one pass, each pass sees the composed result of the one
+  // before rather than its raw output.
+  bool chainComposed = true;
+  // Whether the manager exposes the model's knobs per pass. Off: one set of
+  // controls, propagated into every pass. On: each pass has its own. The
+  // passes themselves are always written out in full, so the runtime never
+  // needs to know which mode produced them.
+  bool perPassTuning = false;
+
+  // A/B split: the fraction of the frame's width, from the left, presented
+  // untouched. 0 is off, 0.5 splits down the middle. A thin line marks the
+  // seam. Costs nothing when off -- it is a constant in the compose.
+  float splitView = 0.0f;
+
+  // The passes that will actually run: `passes`, or one pass of `base`.
+  std::vector<NrPassSettings> Effective() const {
+    if (passes.empty()) return {base};
+    return passes;
+  }
+};
+
+// The application the overlay captures: the window last chosen in the
+// manager. Identified by what can be read from a window without opening its
+// process -- class name and title. Empty means nothing has been chosen yet,
+// and the runtime refuses to start rather than guess.
+struct TargetAppSettings {
+  std::string name;
+  std::string windowClass;
+  std::string title;
+  bool Chosen() const { return !windowClass.empty(); }
+};
+
+// Global hotkeys the runtime registers. Strings, as ParseHotkey (core/Hotkeys.h)
+// reads them; an unparseable one is reported and simply not registered.
+struct HotkeySettings {
+  std::string toggleHud = "ctrl+alt+h";
+  std::string toggleOverlay = "ctrl+alt+o";
+  std::string nextPreset = "ctrl+alt+pageup";
+  std::string previousPreset = "ctrl+alt+pagedown";
+  // Save debug frames without leaving the game: the dump happens on the
+  // frame after the press, camera motion and all.
+  std::string dumpFrames = "ctrl+alt+d";
 };
 
 struct Config {
@@ -53,45 +113,71 @@ struct Config {
   bool showOverlay = true;
   uint32_t flowGridSize = 4;
 
-  // Neural rendering by default, because that is what anyone installing this
-  // came for. It is safe as a default precisely because it cannot fail hard:
-  // a missing runtime, a bad hash or a refused feature all degrade to
-  // PassthroughPass with a warning (spec section 11), so a first run on a
-  // machine with none of the operator-supplied files still produces a working
-  // overlay rather than an error.
-  std::string neuralPass = "reshade";
+  // "direct" drives the neural-rendering runtime itself; "passthrough" is the
+  // A/B baseline. Every failure path degrades to passthrough with a warning
+  // (spec section 11), so a first run with none of the operator-supplied files
+  // produces a working overlay rather than an error.
+  std::string neuralPass = "direct";
 
-  // Which DLSS render preset the feature is created with. Named rather than
-  // numbered because the numbers are an SDK detail; DlssPresetFromName maps it.
-  std::string dlssPreset = "cnn-f";
+  // The synthetic depth plane, until there is a real one. "flat" writes the
+  // constant below; "gradient" writes a ground-plane guess -- near at the
+  // bottom of the frame, far at the top -- which is crude but is a shape, and
+  // whether the model reacts to it decides whether real depth is worth
+  // estimating. `depthInverted` tells the runtime near is the high value.
+  float syntheticDepth = 0.0f;
+  std::string depthMode = "flat";
+  bool depthInverted = false;
 
-  // The constant written into the synthetic depth plane. There is no real depth
-  // buffer to capture, so this is a dial, not a measurement.
-  float syntheticDepth = 0.5f;
-
+  // Rectangles the neural pass leaves untouched, in capture pixels.
   std::vector<UiRect> uiMaskRects;
-  uint32_t uiMaskFeather = 0;
+  uint32_t uiMaskFeather = 24;
 
-  NeuralSettings neural;
+  // The name of the preset these settings were last set from, so the manager
+  // and the runtime's hotkeys can say which look is on and cycle from it.
+  // Informational: the values below are the truth.
+  std::string activePreset = "Recommended";
+
+  // Whether the manager shows the settings that are rarely touched: the
+  // pipeline internals, the model's preset slot, the mask's own switches,
+  // chaining, per-pass tuning, temporal stabilisation. Off by default; a
+  // manager preference, not something the runtime reads.
+  bool advancedTuning = false;
+
+  TargetAppSettings app;
+  HotkeySettings hotkeys;
+  NrSettings nr;
+
+  // Which look goes with which window, by window class. The manager applies
+  // the remembered look when a target is chosen and records it when a look is
+  // saved while that target is current.
+  std::vector<std::pair<std::string, std::string>> appLooks;
+
+  // The look remembered for `windowClass`, or empty.
+  std::string LookForApp(std::string_view windowClass) const {
+    for (const auto& [cls, look] : appLooks) {
+      if (cls == windowClass) return look;
+    }
+    return {};
+  }
+  void RememberLookForApp(const std::string& windowClass, const std::string& look) {
+    if (windowClass.empty() || look.empty()) return;
+    for (auto& [cls, remembered] : appLooks) {
+      if (cls == windowClass) { remembered = look; return; }
+    }
+    appLooks.emplace_back(windowClass, look);
+  }
 };
 
-// Never throws. A malformed document, a bad value or an unrecognised key all
-// produce a warning and leave the corresponding default in place: a typo in a
-// config file must not stop the overlay from starting.
-Config ParseConfig(std::string_view toml, std::vector<std::string>& warnings);
+// Parses a TOML document. Never throws; problems are appended to `warnings`
+// and the affected field keeps its default.
+Config ParseConfig(std::string_view text, std::vector<std::string>& warnings);
 
-// Returns nullopt only when the file cannot be read at all. A file that exists
-// but parses badly yields defaults plus warnings, like ParseConfig.
+// nullopt when the file does not exist or cannot be read. A malformed file is
+// a warning, not a failure -- it parses to defaults.
 std::optional<Config> LoadConfig(const std::filesystem::path& path,
                                  std::vector<std::string>& warnings);
 
-// The document ParseConfig would read back unchanged. Written whole rather than
-// edited in place, because the manager owns this file and hand-edits to it are
-// expected to survive only as far as the next save.
 std::string SerializeConfig(const Config& config);
-
-// Writes SerializeConfig to disk. False means the file could not be written --
-// a read-only directory, most likely -- and the caller has to say so.
 bool SaveConfig(const std::filesystem::path& path, const Config& config);
 
 }  // namespace sidecar

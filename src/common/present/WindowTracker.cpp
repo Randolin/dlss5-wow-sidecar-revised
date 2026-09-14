@@ -10,6 +10,7 @@ namespace {
 
 std::mutex g_mutex;
 std::unordered_map<HWND, WindowTracker*> g_trackers;
+ForegroundWatcher* g_foregroundWatcher = nullptr;
 
 }  // namespace
 
@@ -40,47 +41,32 @@ bool ClassNameIsSpecificEnough(const wchar_t* className) {
   return wcslen(className) > 4;
 }
 
-bool WowWindowMatches(const wchar_t* className, const wchar_t* title) {
-  if (!className) return false;
+std::optional<TargetWindow> FindAppWindow(const AppMatch& match) {
+  if (match.windowClass.empty()) return std::nullopt;
 
-  bool known = false;
-  for (const wchar_t* candidate : kWowWindowClasses) {
-    if (wcscmp(className, candidate) == 0) { known = true; break; }
-  }
-  if (!known) return false;
-  if (ClassNameIsSpecificEnough(className)) return true;
+  // Every visible window of the class with a real client area is a candidate;
+  // one whose caption is the remembered title wins, otherwise the first.
+  std::optional<TargetWindow> fallback;
+  HWND hwnd = nullptr;
+  while ((hwnd = FindWindowExW(nullptr, hwnd, match.windowClass.c_str(), nullptr)) != nullptr) {
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) continue;
+    auto rect = ClientRectInScreen(hwnd);
+    if (!rect) continue;
+    if (rect->right - rect->left <= 0 || rect->bottom - rect->top <= 0) continue;
 
-  // A generic class has to be backed up by the title.
-  return title != nullptr && wcscmp(title, kWowWindowTitle) == 0;
-}
+    TargetWindow t;
+    t.hwnd = hwnd;
+    t.clientScreen = *rect;
+    t.borderless = IsBorderless(hwnd);
 
-std::optional<TargetWindow> FindWowWindow() {
-  // A client can own several windows of its class, most of them hidden or
-  // zero-sized, so take the first visible one with a real client area rather
-  // than whatever FindWindow happens to return first.
-  for (const wchar_t* className : kWowWindowClasses) {
-    HWND hwnd = nullptr;
-    while ((hwnd = FindWindowExW(nullptr, hwnd, className, nullptr)) != nullptr) {
-      if (!IsWindowVisible(hwnd)) continue;
-
-      // GetWindowTextW opens nothing: it is a message to the window, not a
-      // handle to the process behind it (I2).
+    if (!match.title.empty()) {
       wchar_t title[256] = {};
       GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
-      if (!WowWindowMatches(className, title)) continue;
-
-      auto rect = ClientRectInScreen(hwnd);
-      if (!rect) continue;
-      if (rect->right - rect->left <= 0 || rect->bottom - rect->top <= 0) continue;
-
-      TargetWindow t;
-      t.hwnd = hwnd;
-      t.clientScreen = *rect;
-      t.borderless = IsBorderless(hwnd);
-      return t;
+      if (match.title == title) return t;
     }
+    if (!fallback) fallback = t;
   }
-  return std::nullopt;
+  return fallback;
 }
 
 std::unique_ptr<WindowTracker> WindowTracker::Create(HWND target, MovedCallback onMoved) {
@@ -132,6 +118,40 @@ void CALLBACK WindowTracker::EventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
   }
   if (!tracker || !tracker->onMoved_) return;
   if (auto rect = ClientRectInScreen(hwnd)) tracker->onMoved_(*rect);
+}
+
+std::unique_ptr<ForegroundWatcher> ForegroundWatcher::Create(ChangedCallback onChanged) {
+  std::unique_ptr<ForegroundWatcher> w(new ForegroundWatcher());
+  w->onChanged_ = std::move(onChanged);
+  // Process and thread zero: every process. Still OUTOFCONTEXT, so the
+  // system delivers the event to this thread's queue rather than loading
+  // anything anywhere (I3).
+  w->hook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                             nullptr, &ForegroundWatcher::EventProc, 0, 0,
+                             WINEVENT_OUTOFCONTEXT);
+  if (!w->hook_) return nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_foregroundWatcher = w.get();
+  }
+  return w;
+}
+
+ForegroundWatcher::~ForegroundWatcher() {
+  if (hook_) UnhookWinEvent(hook_);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_foregroundWatcher == this) g_foregroundWatcher = nullptr;
+}
+
+void CALLBACK ForegroundWatcher::EventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                           LONG, LONG, DWORD, DWORD) {
+  if (event != EVENT_SYSTEM_FOREGROUND) return;
+  ForegroundWatcher* watcher = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    watcher = g_foregroundWatcher;
+  }
+  if (watcher && watcher->onChanged_) watcher->onChanged_(hwnd);
 }
 
 }  // namespace sidecar

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -27,8 +28,14 @@ class Log {
   Log() = default;
 
   // Optional. Without it the log is memory-only, which is what tests use.
+  // Any existing file at `path` is moved aside to `<path>.prev` first: a crash
+  // takes its own explanation with it otherwise, since the next launch
+  // truncates the file before anyone reads it.
   bool OpenFile(const std::filesystem::path& path);
 
+  // Lines carry milliseconds since the log opened. Relative rather than
+  // wall-clock because the questions asked of a log are "how long after the
+  // start" and "how far apart were these two", not "what time was it".
   void Write(LogLevel level, std::string_view message);
 
   void Info(std::string_view message) { Write(LogLevel::Info, message); }
@@ -58,6 +65,7 @@ class Log {
   LogLevel minimum_ = LogLevel::Info;
   std::string lastError_;
   std::ofstream file_;
+  std::chrono::steady_clock::time_point opened_ = std::chrono::steady_clock::now();
 };
 
 // The process-wide log. A singleton because every subsystem needs to reach it

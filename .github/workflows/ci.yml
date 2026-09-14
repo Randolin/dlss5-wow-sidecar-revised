@@ -1,8 +1,8 @@
 name: CI
 
-# The project's central claim is that no code is loaded into Wow.exe, and that
-# the claim is checked rather than asserted. This workflow is where that check
-# runs for anyone who did not build locally.
+# The project's central claim is that no code is loaded into the captured
+# application's process, and that the claim is checked rather than asserted.
+# This workflow is where that check runs for anyone who did not build locally.
 #
 # The NVIDIA Optical Flow SDK is a manual download and is never vendored (I11),
 # so CI builds without it: NvofaFlow reports Available() false and the two
@@ -50,4 +50,4 @@ jobs:
       # too, independently of the build having run its post-build step.
       - name: Re-check binaries against the safety invariants
         run: |
-          python ci/check_imports.py build\Debug\wowsidecar.exe build\Debug\wowsidecar-manager.exe build\Debug\testpattern.exe
+          python ci/check_imports.py build\Debug\sidecar.exe build\Debug\sidecar-manager.exe build\Debug\nvngx.dll_sidecar.dll build\Debug\testpattern.exe

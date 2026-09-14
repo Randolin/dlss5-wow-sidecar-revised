@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace sidecar {
 
@@ -39,11 +40,18 @@ inline constexpr const wchar_t* kWowWindowTitle = L"World of Warcraft";
 // entirely or captures somebody else's window.
 bool ClassNameIsSpecificEnough(const wchar_t* className);
 
-// Given what can be read from a window without opening its process, does this
-// look like WoW's main window?
-bool WowWindowMatches(const wchar_t* className, const wchar_t* title);
+// How the target application is recognised: the class name and title of the
+// window the operator chose. Both are read off the window itself, never from
+// a process handle (I2). An empty class matches nothing -- there is no
+// guessing.
+struct AppMatch {
+  std::wstring windowClass;
+  std::wstring title;
+};
 
-std::optional<TargetWindow> FindWowWindow();
+// The first visible window with a real client area that matches, preferring
+// one whose title is `title` when several share the class.
+std::optional<TargetWindow> FindAppWindow(const AppMatch& match);
 
 // Display mode from window styles only. The spec forbids reading WoW's game
 // data, so Config.wtf is never parsed (I5).
@@ -72,6 +80,37 @@ class WindowTracker {
   HWINEVENTHOOK hook_ = nullptr;
   HWND target_ = nullptr;
   MovedCallback onMoved_;
+};
+
+// Reports every change of the foreground window, system-wide.
+//
+// The overlay is opaque and topmost, so it must only be up while the game is
+// what the player is looking at. Alt-tabbing to the manager -- the only way to
+// reach Stop or configure mode -- otherwise foregrounds it *behind* an overlay
+// that never yields, and the operator is stuck with the panic key. Watching
+// the foreground is how every game overlay solves this.
+//
+// Same terms as WindowTracker: WINEVENT_OUTOFCONTEXT, so nothing is loaded
+// into any other process (I3). The hook is system-wide because the interesting
+// event is the game *losing* the foreground to something we cannot name in
+// advance. The callback runs on the creating thread's message loop, so create
+// it on the thread that owns the windows and pumps.
+class ForegroundWatcher {
+ public:
+  using ChangedCallback = std::function<void(HWND foreground)>;
+
+  static std::unique_ptr<ForegroundWatcher> Create(ChangedCallback onChanged);
+  ~ForegroundWatcher();
+
+ private:
+  ForegroundWatcher() = default;
+
+  static void CALLBACK EventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                 LONG objectId, LONG childId,
+                                 DWORD threadId, DWORD timestamp);
+
+  HWINEVENTHOOK hook_ = nullptr;
+  ChangedCallback onChanged_;
 };
 
 }  // namespace sidecar

@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <fstream>
+
 #include "manager/Install.h"
 
 using namespace sidecar;
@@ -28,46 +30,74 @@ TEST_CASE("every component names a file, a source and a purpose", "[unit]") {
   }
 }
 
-TEST_CASE("the two nvngx runtimes are never confused for each other", "[unit]") {
-  // nvngx_dlss.dll is a prefix of nvngx_dlssnr.dll. They do different jobs, and
-  // installing one where the other belongs produces a runtime that loads and
-  // then fails at feature creation with no diagnostic at all -- which is
-  // exactly the failure this project spent a spike chasing.
-  const auto& nr = ByName("nvngx_dlssnr.dll");
-  const auto& upscaler = ByName("nvngx_dlss.dll");
+TEST_CASE("the Setup page asks for the two runtimes and nothing else", "[unit]") {
+  // The neural runtime, and the DLSS runtime it builds a feature from
+  // internally. Nothing from the retired ReShade route.
+  REQUIRE(Components().size() == 2);
+  REQUIRE(ByName("nvngx_dlssnr.dll").required);
+  REQUIRE(ByName("nvngx_dlss.dll").required);
+  for (const auto& c : Components()) {
+    REQUIRE(std::string(c.accepts).find("addon") == std::string::npos);
+    REQUIRE(std::string(c.accepts).find("dxgi") == std::string::npos);
+  }
+}
 
+TEST_CASE("file matching is case-insensitive and whole-name", "[unit]") {
+  const auto& nr = ByName("nvngx_dlssnr.dll");
   REQUIRE(FileMatchesComponent(nr, "nvngx_dlssnr.dll"));
-  REQUIRE_FALSE(FileMatchesComponent(nr, "nvngx_dlss.dll"));
-  REQUIRE(FileMatchesComponent(upscaler, "nvngx_dlss.dll"));
-  REQUIRE_FALSE(FileMatchesComponent(upscaler, "nvngx_dlssnr.dll"));
-}
-
-TEST_CASE("matching ignores case, because Windows does", "[unit]") {
-  const auto& nr = ByName("nvngx_dlssnr.dll");
   REQUIRE(FileMatchesComponent(nr, "NVNGX_DLSSNR.DLL"));
-  REQUIRE(FileMatchesComponent(nr, "NvNgx_DlssNr.dll"));
-}
-
-TEST_CASE("ReShade is accepted under the names it actually ships as", "[unit]") {
-  const auto& reshade = ByName("dxgi.dll");
-  REQUIRE(FileMatchesComponent(reshade, "dxgi.dll"));
-  REQUIRE(FileMatchesComponent(reshade, "ReShade64.dll"));
-  REQUIRE(FileMatchesComponent(reshade, "d3d11.dll"));
-  REQUIRE_FALSE(FileMatchesComponent(reshade, "ReShade32.dll"));
+  // A prefix of the right name is the wrong file.
+  REQUIRE_FALSE(FileMatchesComponent(nr, "nvngx_dlss.dll"));
+  REQUIRE_FALSE(FileMatchesComponent(nr, "nvngx_dlssnr.dll.bak"));
+  REQUIRE_FALSE(FileMatchesComponent(ByName("nvngx_dlss.dll"), "nvngx_dlssnr.dll"));
 }
 
 TEST_CASE("a file matching nothing reports no component", "[unit]") {
   REQUIRE(ComponentForFile("readme.txt") == static_cast<size_t>(-1));
   REQUIRE(ComponentForFile("") == static_cast<size_t>(-1));
-  REQUIRE(ComponentForFile("renodx-dlss5.addon64") != static_cast<size_t>(-1));
+  REQUIRE(ComponentForFile("dxgi.dll") == static_cast<size_t>(-1));
+  REQUIRE(ComponentForFile("nvngx_dlss.dll") != static_cast<size_t>(-1));
+  REQUIRE(ComponentForFile("nvngx_dlss.dll") != ComponentForFile("nvngx_dlssnr.dll"));
 }
 
-TEST_CASE("the uninstall plan lists nothing for an empty directory", "[unit]") {
-  // Whatever the temporary directory holds, it is not the sidecar's files, so
-  // the plan has to come back empty -- an uninstaller that finds work to do in
-  // a directory it was never installed into is the dangerous kind of bug.
-  const auto plan = UninstallPlan(std::filesystem::temp_directory_path() /
-                                      "dlss5-sidecar-not-installed-here",
-                                  true);
-  REQUIRE(plan.empty());
+TEST_CASE("presence and the uninstall plan are judged on disk", "[unit]") {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "dlss5-sidecar-install-test";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  REQUIRE_FALSE(ec);
+
+  const auto& nr = ByName("nvngx_dlssnr.dll");
+  REQUIRE(InstalledFiles(nr, dir).empty());
+  REQUIRE(UninstallPlan(dir, false).empty());
+
+  { std::ofstream(dir / "nvngx_dlssnr.dll") << "x"; }
+  REQUIRE(InstalledFiles(nr, dir).size() == 1);
+  REQUIRE(UninstallPlan(dir, false).size() == 1);
+
+  // Generated files join the plan only when asked, and only if they exist.
+  { std::ofstream(dir / "presets.toml") << "x"; }
+  REQUIRE(UninstallPlan(dir, false).size() == 1);
+  REQUIRE(UninstallPlan(dir, true).size() == 2);
+
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("installing refuses a self-copy and a missing source", "[unit]") {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "dlss5-sidecar-install-copy";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const auto& nr = ByName("nvngx_dlssnr.dll");
+
+  REQUIRE_FALSE(InstallComponent(nr, dir / "does-not-exist.dll", dir).ok);
+
+  { std::ofstream(dir / "nvngx_dlssnr.dll") << "already here"; }
+  const auto self = InstallComponent(nr, dir / "nvngx_dlssnr.dll", dir);
+  REQUIRE(self.ok);
+  REQUIRE(fs::file_size(dir / "nvngx_dlssnr.dll") > 0);   // not truncated
+
+  fs::remove_all(dir, ec);
 }

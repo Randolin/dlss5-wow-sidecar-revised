@@ -4,6 +4,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/Config.h"
 #include "core/GpuProfile.h"
 
 namespace sidecar {
@@ -20,17 +21,8 @@ struct ProbeResult {
   std::string remedy;
 };
 
-// Pure predicates, so the safety invariants they enforce are unit-testable
-// without a real WoW install anywhere near the test machine.
-
-// I7: refuses to treat anything that looks like a WoW installation as a place
-// to put the sidecar.
-bool PathLooksLikeWowInstall(const std::filesystem::path& path);
-
-// I8: names of loaders that side-load into a game process by masquerading as
-// system DLLs the game already imports. Matching is on filenames only; none of
-// these files is ever opened.
-std::vector<std::string> FindInjectorLoaders(const std::vector<std::string>& filenames);
+// Pure predicates, so what the probes decide is unit-testable without
+// hardware anywhere near the test machine.
 
 // The neural-runtime verdict, given a digest rather than a file. Split out
 // because the recognised path cannot otherwise be tested: producing a file that
@@ -49,13 +41,11 @@ ProbeResult ProbeDriver();
 ProbeResult ProbeWindows();
 ProbeResult ProbeRefreshRate();
 ProbeResult ProbeNeuralRuntime(const std::filesystem::path& sidecarDir);
-ProbeResult ProbeReshade(const std::filesystem::path& sidecarDir);
-ProbeResult ProbeWowWindow();
-ProbeResult ProbeInjectorScan(const std::filesystem::path& wowDir);
-ProbeResult ProbeSidecarPath(const std::filesystem::path& sidecarDir,
-                             const std::filesystem::path& wowDir);
+ProbeResult ProbeNrForwarder(const std::filesystem::path& sidecarDir);
+// Whether the target application's window is up and borderless.
+ProbeResult ProbeAppWindow(const TargetAppSettings& app);
 
 std::vector<ProbeResult> RunAllProbes(const std::filesystem::path& sidecarDir,
-                                      const std::filesystem::path& wowDir);
+                                      const TargetAppSettings& app);
 
 }  // namespace sidecar

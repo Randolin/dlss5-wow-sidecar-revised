@@ -1,5 +1,7 @@
 #include "gpu/DeviceBridge.h"
 
+#include <algorithm>
+
 using Microsoft::WRL::ComPtr;
 
 namespace sidecar {
@@ -16,13 +18,15 @@ ComPtr<IDXGIAdapter1> FindAdapterByLuid(LUID luid) {
 }  // namespace
 
 std::unique_ptr<DeviceBridge> DeviceBridge::Create(LUID adapterLuid,
-                                                   uint32_t width, uint32_t height) {
+                                                   uint32_t width, uint32_t height,
+                                                   DXGI_FORMAT ringFormat) {
   auto adapter = FindAdapterByLuid(adapterLuid);
   if (!adapter) return nullptr;
 
   std::unique_ptr<DeviceBridge> b(new DeviceBridge());
   b->width_ = width;
   b->height_ = height;
+  b->format_ = ringFormat;
 
   // Both devices are created on the same adapter so shared handles are valid.
   ComPtr<ID3D11Device> dev11;
@@ -58,7 +62,7 @@ std::unique_ptr<DeviceBridge> DeviceBridge::Create(LUID adapterLuid,
   td.Height = height;
   td.MipLevels = 1;
   td.ArraySize = 1;
-  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.Format = ringFormat;
   td.SampleDesc.Count = 1;
   td.Usage = D3D11_USAGE_DEFAULT;
   td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -77,6 +81,10 @@ std::unique_ptr<DeviceBridge> DeviceBridge::Create(LUID adapterLuid,
       return nullptr;
     }
   }
+  // Auto-reset: one wake per published frame, and a consumer that is already
+  // behind never sleeps.
+  b->frameReady_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!b->frameReady_) return nullptr;
   return b;
 }
 
@@ -85,12 +93,17 @@ DeviceBridge::~DeviceBridge() {
     if (slot.sharedHandle) CloseHandle(slot.sharedHandle);
   }
   if (fenceHandle_) CloseHandle(fenceHandle_);
+  if (frameReady_) CloseHandle(frameReady_);
 }
 
 bool DeviceBridge::Publish(ID3D11Texture2D* src) {
   Slot& slot = ring_[writeIndex_];
   d3d11Ctx_->CopyResource(slot.tex11.Get(), src);
+  return Commit();
+}
 
+bool DeviceBridge::Commit() {
+  Slot& slot = ring_[writeIndex_];
   slot.fenceValue = nextFenceValue_++;
   d3d11Ctx_->Signal(fence11_.Get(), slot.fenceValue);
   d3d11Ctx_->Flush();
@@ -99,7 +112,14 @@ bool DeviceBridge::Publish(ID3D11Texture2D* src) {
   const int32_t previous = published_.exchange(static_cast<int32_t>(writeIndex_),
                                                std::memory_order_release);
   writeIndex_ = (writeIndex_ + 1) % kRingDepth;
+  if (frameReady_) SetEvent(frameReady_);
   return previous != -1;
+}
+
+bool DeviceBridge::WaitForFrame(uint32_t timeoutMs) const {
+  if (published_.load(std::memory_order_acquire) >= 0) return true;
+  if (!frameReady_) return false;
+  return WaitForSingleObject(frameReady_, timeoutMs) == WAIT_OBJECT_0;
 }
 
 std::optional<BridgeFrame> DeviceBridge::AcquireLatest() {

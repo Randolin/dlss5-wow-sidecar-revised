@@ -17,29 +17,62 @@ TEST_CASE("the default pass name builds passthrough without complaint", "[unit]"
   REQUIRE(warnings.empty());
 }
 
-// "reshade" is real now, but it needs a device. Asked without one it must say
-// so rather than pretending, because the caller that forgot the device would
-// otherwise silently get passthrough and no clue why.
-TEST_CASE("the reshade pass reports that it needs a device", "[unit]") {
+TEST_CASE("an unknown pass name warns and falls back to passthrough", "[unit]") {
   std::vector<std::string> warnings;
-  auto pass = MakeNeuralPass("reshade", warnings);
+  auto pass = MakeNeuralPass("no-such-pass", warnings);
   REQUIRE(pass != nullptr);
   REQUIRE(std::string(pass->Name()) == "passthrough");
   REQUIRE(warnings.size() == 1);
-  REQUIRE(warnings[0].find("reshade") != std::string::npos);
+  REQUIRE(warnings[0].find("no-such-pass") != std::string::npos);
+}
+
+// "ngx" and "reshade" are retired names; both become "direct". The warning
+// says so, and without a device the direct pass then explains that it needs
+// one.
+TEST_CASE("retired pass names are aliases for direct", "[unit]") {
+  for (const char* old : {"ngx", "reshade"}) {
+    std::vector<std::string> warnings;
+    auto pass = MakeNeuralPass(old, warnings);
+    REQUIRE(pass != nullptr);
+    REQUIRE(std::string(pass->Name()) == "passthrough");
+    REQUIRE(warnings.size() == 2);
+    REQUIRE(warnings[0].find("retired") != std::string::npos);
+    REQUIRE(warnings[1].find("device") != std::string::npos);
+  }
+}
+
+TEST_CASE("the direct pass reports that it needs a device", "[unit]") {
+  std::vector<std::string> warnings;
+  auto pass = MakeNeuralPass("direct", warnings);
+  REQUIRE(pass != nullptr);
+  REQUIRE(std::string(pass->Name()) == "passthrough");
+  REQUIRE(warnings.size() == 1);
+  REQUIRE(warnings[0].find("direct") != std::string::npos);
   REQUIRE(warnings[0].find("device") != std::string::npos);
 }
 
-// Route A is closed: the M3 spikes established that the neural-rendering
-// runtime refuses an NGX session set up by anything but the NGX core, through
-// both the core's registry and the runtime's own exports.
-TEST_CASE("the ngx pass reports that it is unreachable", "[unit]") {
+// The direct pass with a device but nothing beside it: it must say which piece
+// is missing, because the runtime, the forwarder and the NGX core are three
+// different things to go and fetch.
+TEST_CASE("the direct pass explains itself when its pieces are missing", "[device]") {
+  const auto gpu = DetectPrimaryGpu();
+  if (!gpu) { SUCCEED("no NVIDIA adapter"); return; }
+  auto bridge = DeviceBridge::Create(gpu->luid, 256, 256);
+  REQUIRE(bridge != nullptr);
+
+  NeuralPassContext ctx;
+  ctx.device = bridge->D3d12();
+  ctx.runtimeDir = std::filesystem::temp_directory_path() / "dlss5-sidecar-no-runtime-here";
+  ctx.width = 256;
+  ctx.height = 256;
+  ctx.arch = gpu->arch;
+
   std::vector<std::string> warnings;
-  auto pass = MakeNeuralPass("ngx", warnings);
+  auto pass = MakeNeuralPass("direct", ctx, warnings);
   REQUIRE(pass != nullptr);
   REQUIRE(std::string(pass->Name()) == "passthrough");
   REQUIRE(warnings.size() == 1);
-  REQUIRE(warnings[0].find("ngx") != std::string::npos);
+  REQUIRE(warnings[0].find("nvngx_dlssnr.dll") != std::string::npos);
 }
 
 // With a device but no runtime beside it, the failure has to name a reason an

@@ -1,55 +1,81 @@
 #include "neural/NeuralPassFactory.h"
 
-#include "neural/NgxSession.h"
+#include "neural/DirectNrPass.h"
 #include "neural/PassthroughPass.h"
-#include "neural/ReshadeHostedPass.h"
 
 namespace sidecar {
+
+NrPassSetup SetupFromSettings(const NrSettings& nr) {
+  NrPassSetup setup;
+  for (const auto& s : nr.Effective()) {
+    NrPassTuning t;
+    t.preset = static_cast<uint32_t>(s.preset);
+    t.style = static_cast<uint32_t>(s.style);
+    t.intensity = s.intensity;
+    t.localStructure = s.localStructure;
+    t.localTone = s.localTone;
+    t.skinStructure = s.skinStructure;
+    t.autoMask = s.autoMask;
+    t.uiCorrection = s.uiCorrection;
+    setup.passes.push_back(t);
+  }
+  setup.modelScale = nr.modelScale;
+  setup.chainComposed = nr.chainComposed;
+  setup.finalFull = nr.finalPassFull;
+  return setup;
+}
+
+NrBridgeParams BridgeFromSettings(const NrSettings& nr) {
+  NrBridgeParams b;
+  b.enabled = nr.bridge;
+  b.paperWhiteNits = nr.paperWhiteNits;
+  b.strength = 1.0f;   // "blend" is retired; the model's intensity is the dial
+  b.colourPreserve = nr.colourPreserve;
+  b.highlightProtect = nr.highlightProtect;
+  b.split = nr.splitView;
+  b.temporalSmoothing = nr.temporalSmoothing;
+  b.temporalSpatial = nr.temporalSpatial;
+  return b;
+}
 
 std::unique_ptr<INeuralPass> MakeNeuralPass(std::string_view name,
                                             const NeuralPassContext& context,
                                             std::vector<std::string>& warnings) {
   if (name == "passthrough") return PassthroughPass::Create();
 
-  if (name == "reshade") {
+  if (name == "reshade" || name == "ngx") {
+    // Retired routes. "ngx" was the name for the direct path when it was
+    // believed unreachable; "reshade" was the add-on-hosted route that the
+    // direct path replaced. Both mean "direct" now.
+    warnings.emplace_back("neural_pass \"" + std::string(name) +
+                          "\" is retired; using \"direct\"");
+    return MakeNeuralPass("direct", context, warnings);
+  }
+
+  if (name == "direct") {
     if (!context.device) {
-      warnings.emplace_back("neural_pass \"reshade\" needs a graphics device; "
+      warnings.emplace_back("neural_pass \"direct\" needs a graphics device; "
                             "using passthrough");
       return PassthroughPass::Create();
     }
 
-    ReshadeHostedPass::Options options;
+    DirectNrPass::Options options;
     options.runtimeDir = context.runtimeDir;
     options.width = context.width;
     options.height = context.height;
     options.arch = context.arch;
     options.syntheticDepth = context.syntheticDepth;
-    if (auto preset = DlssPresetFromName(context.dlssPreset)) {
-      options.preset = *preset;
-    } else {
-      warnings.emplace_back("dlss_preset \"" + context.dlssPreset +
-                            "\" is not a known preset; using \"" +
-                            DlssPresetName(options.preset) + "\"");
-    }
+    options.depthGradient = context.depthGradient;
+    options.depthInverted = context.depthInverted;
+    options.setup = SetupFromSettings(context.nr);
+    options.bridge = BridgeFromSettings(context.nr);
 
     std::string reason;
-    if (auto pass = ReshadeHostedPass::Create(context.device, options, reason)) {
+    if (auto pass = DirectNrPass::Create(context.device, options, reason)) {
       return pass;
     }
-    // Spec section 11: a neural runtime that will not come up degrades to
-    // passthrough and says why, rather than refusing to start.
-    warnings.emplace_back("neural_pass \"reshade\" is unavailable (" + reason +
+    warnings.emplace_back("neural_pass \"direct\" is unavailable (" + reason +
                           "); using passthrough");
-    return PassthroughPass::Create();
-  }
-
-  if (name == "ngx") {
-    // Route A. The M3 spikes established that the neural-rendering runtime
-    // refuses an NGX session set up by anyone but the NGX core, through both the
-    // core's feature registry and the runtime's own exports, so there is nothing
-    // to build here. See docs/spikes/2026-08-31-reshade-detour.md.
-    warnings.emplace_back("neural_pass \"ngx\" is not reachable on any shipping "
-                          "driver; using passthrough");
     return PassthroughPass::Create();
   }
 

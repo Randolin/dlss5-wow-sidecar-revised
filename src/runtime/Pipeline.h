@@ -18,6 +18,7 @@
 #include "flow/FlowToMotionVec.h"
 #include "flow/NvofaFlow.h"
 #include "gpu/FormatNormalize.h"
+#include "gpu/HdrBridge.h"
 #include "gpu/Luminance.h"
 #include "gpu/UiMask.h"
 #include "neural/INeuralPass.h"
@@ -48,15 +49,24 @@ struct PipelineConfig {
   // Which pass to build. Only consulted when Create() is handed a null pass,
   // which is how the runtime asks for one -- a device-backed pass cannot be
   // constructed before the device exists, and must be rebuilt with it after
-  // device loss.
-  std::string neuralPass = "passthrough";
-  // The DLSS render preset by name, and the constant filling the synthetic
-  // depth plane. Both are quality dials for the neural pass; neither can fail
-  // the pipeline.
-  std::string dlssPreset = "cnn-f";
-  float syntheticDepth = 0.5f;
+  // device loss. "direct" or "passthrough"; a pass that cannot be built
+  // degrades to passthrough with a logged reason.
+  std::string neuralPass = "direct";
+  // The constant filling the synthetic depth plane, or a ground-plane
+  // gradient; and whether the runtime should read near as the high value.
+  float syntheticDepth = 0.0f;
+  bool depthGradient = false;
+  bool depthInverted = false;
+  // The direct path's settings. Only consulted when neuralPass is "direct".
+  NrSettings nr;
   // Where nvngx_*.dll live. Defaults to the executable's own directory.
   std::filesystem::path runtimeDir;
+  // The look these settings came from, for the status readout.
+  std::string activePreset;
+  // HDR: how an HDR capture is tone-mapped for the model and how its edit is
+  // applied back. Only consulted when the target's display is in HDR mode,
+  // which the pipeline decides for itself at creation.
+  float hdrPaperWhiteNits = 0.0f;   // 0 = automatic
 };
 
 // Owns the render thread and the per-frame orchestration: acquire the newest
@@ -87,6 +97,46 @@ class Pipeline {
   void SetHudVisible(bool visible);
   bool OverlayVisible() const { return overlayVisible_.load(std::memory_order_acquire); }
   bool HudVisible() const { return hudVisible_.load(std::memory_order_acquire); }
+
+  // Configure mode: the overlay takes input so the ReShade UI inside this
+  // process can be driven. Leaving it hands the foreground back to the game.
+  // Never restored across a rebuild -- a fresh overlay always comes up
+  // click-through, because that is the only state that is safe by default.
+  // Call from the thread that called Start().
+  void SetOverlayInteractive(bool on);
+  bool OverlayInteractive() const { return overlayInteractive_.load(std::memory_order_acquire); }
+
+  // The foreground changed. The overlay is only shown while the game -- or, in
+  // configure mode, the overlay itself -- is what has focus; otherwise it gets
+  // out of the way so the manager and everything else stay reachable. Runs on
+  // the owner thread, from the watcher's hook.
+  void OnForegroundChanged(HWND foreground);
+
+  // Asks the render loop to write the neural pass's input and output, and the
+  // presented frame, to BMPs beside the sidecar on its next frame, and to log
+  // how much the pass changed the picture. Safe from any thread.
+  void RequestDebugDump() { dumpRequested_.store(true, std::memory_order_release); }
+
+  // The UI-mask calibrator's two captures. Step 1 stores the frame with the
+  // interface drawn; step 2 diffs the current frame against it and writes the
+  // result beside the sidecar. Safe from any thread.
+  void RequestCalibrationCapture(int step) {
+    calibrationRequest_.store(step, std::memory_order_release);
+  }
+
+  // Applies a new configuration to the running pipeline where it can: the
+  // direct pass's compose parameters and pass setup are handed over live.
+  // Returns false when something changed that needs a rebuild -- the caller
+  // then calls RebuildAndRestart, which reads the config stored here. Owner
+  // thread.
+  bool ApplySettings(const PipelineConfig& config);
+
+  // The name shown in the status block. Set by the runtime when a hotkey
+  // changes the look; the manager mirrors it into the config file.
+  void SetActivePreset(const std::string& name);
+
+  // Which global hotkeys registered, for the status block. Any thread.
+  void SetHotkeyMask(uint32_t mask) { hotkeyMask_.store(mask, std::memory_order_release); }
 
   // Where the manager's live numbers come from.
   //
@@ -129,6 +179,31 @@ class Pipeline {
   Pipeline() = default;
   void RenderLoop();
   void FailAndHide(const char* reason);
+
+  // Reconciles what the operator asked for (overlayVisible_, hudVisible_) with
+  // whether the game currently has focus (gameFocused_), and shows or hides the
+  // two windows accordingly. Owner thread only: it moves windows.
+  void ApplyVisibility();
+
+  // Render thread, after a present. Reads back the widened frame, the pass's
+  // output and the presented frame, writes them as BMPs, logs the mean
+  // difference the pass made. Stalls the GPU for one frame; only on request.
+  void DumpDebugFrames();
+
+  // Render thread. Copies one of the pipeline's textures to the CPU as 8-bit
+  // BGR, top row first. Stalls the GPU; only for diagnostics and calibration.
+  // Render thread. Copies one of the pipeline's textures to the CPU as 8-bit
+  // BGR, top row first, at the texture's own size (reported through outWidth
+  // and outHeight). Float formats are converted per channel with `scale` and
+  // `bias` applied first, so a gain map can be written as mid-grey-is-one.
+  // Stalls the GPU; only for diagnostics and calibration.
+  std::vector<uint8_t> ReadbackBgr(ID3D12Resource* texture, D3D12_RESOURCE_STATES restState,
+                                   bool rgba16f, bool scRgb = false, uint32_t* outWidth = nullptr,
+                                   uint32_t* outHeight = nullptr, float scale = 1.0f,
+                                   float bias = 0.0f);
+
+  // Render thread, after a present. Performs the requested calibration step.
+  void CalibrationCapture(int step);
 
   // One reporting window's worth of "where did the frame go", averaged per
   // frame. Assembled by the render loop, which is the only place that can see
@@ -211,17 +286,50 @@ class Pipeline {
     std::unique_ptr<UiMask> uiMask;
     Microsoft::WRL::ComPtr<ID3D12Resource> neuralTarget;
     bool maskUploaded = false;
+
+    // HDR capture. When the target's display is in HDR mode the ring, the work
+    // target and the swapchain are FP16 scRGB, `normalized` holds the
+    // tone-mapped SDR view the model and the flow see, and the compose below
+    // puts the model's edit back onto the HDR frame instead of the mask blend.
+    bool hdr = false;
+    std::unique_ptr<HdrBridge> hdrBridge;
+    HdrBridge::Params hdrParams;
+
+    // The resolve folded into the compose: the direct pass writes the
+    // presentable BGRA8 target itself, so the mask blend (which doubled as the
+    // RGBA16F-to-BGRA8 resolve) is not created and not run. Only on an SDR
+    // desktop, with no mask rectangles, on a device that can store typed BGRA8
+    // from a compute shader. One full-resolution pass saved per frame.
+    bool directResolve = false;
   };
   DeviceState dev_;
 
   PipelineConfig config_;
   GpuInfo gpu_;
   std::unique_ptr<PanicSwitch> panic_;
+  // Outside DeviceState on purpose: it is not device-derived and must survive
+  // a rebuild, and it is created on the owner thread in Start(), which is the
+  // thread whose message loop delivers its events.
+  std::unique_ptr<ForegroundWatcher> foreground_;
+  // Whether the game (or this process, in configure mode) has the foreground.
+  // Owner thread only.
+  bool gameFocused_ = true;
   std::thread renderThread_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stopRequested_{false};
   std::atomic<bool> rebuildRequested_{false};
   std::atomic<bool> targetLost_{false};
+  std::atomic<bool> dumpRequested_{false};
+  // Set while the overlay is not on screen; the render thread idles.
+  std::atomic<bool> paused_{false};
+  std::atomic<int> calibrationRequest_{0};
+  // The calibrator's first capture, and what the status block reports.
+  std::vector<uint8_t> calibrationWithUi_;
+  std::atomic<uint32_t> calibrationStep_{0};
+  std::atomic<uint32_t> calibrationRects_{0};
+  std::mutex presetMutex_;
+  std::string activePreset_;
+  std::atomic<uint32_t> hotkeyMask_{0};
   // True when dev_.pass was built from config_ rather than handed in, and so
   // must be rebuilt against a new device rather than carried across one.
   bool passFromConfig_ = false;
@@ -234,6 +342,7 @@ class Pipeline {
   // reverting to the configured default.
   std::atomic<bool> overlayVisible_{true};
   std::atomic<bool> hudVisible_{true};
+  std::atomic<bool> overlayInteractive_{false};
   StatusSink statusSink_;
 
   mutable std::mutex errorMutex_;

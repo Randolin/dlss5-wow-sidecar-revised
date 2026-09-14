@@ -9,33 +9,6 @@
 
 using namespace sidecar;
 
-// The class list has grown twice from observation, and each addition is a
-// chance to capture the wrong application's window. These pin the rule.
-
-TEST_CASE("distinctive WoW classes match on their own", "[unit]") {
-  CHECK(WowWindowMatches(L"waApplication Window", L"World of Warcraft"));
-  CHECK(WowWindowMatches(L"GxWindowClass", L"World of Warcraft"));
-  // A localised client may not be titled in English, so a distinctive class is
-  // not made conditional on the title.
-  CHECK(WowWindowMatches(L"waApplication Window", L"Monde des Ténèbres"));
-  CHECK(WowWindowMatches(L"GxWindowClass", L""));
-}
-
-// The 2026-08 retail client registers plain "w", which any application could
-// use, so on its own it must not be enough.
-TEST_CASE("the generic class needs the title to agree", "[unit]") {
-  CHECK(WowWindowMatches(L"w", L"World of Warcraft"));
-  CHECK_FALSE(WowWindowMatches(L"w", L"Notepad"));
-  CHECK_FALSE(WowWindowMatches(L"w", L""));
-  CHECK_FALSE(WowWindowMatches(L"w", nullptr));
-}
-
-TEST_CASE("unknown classes never match", "[unit]") {
-  CHECK_FALSE(WowWindowMatches(L"Chrome_WidgetWin_1", L"World of Warcraft"));
-  CHECK_FALSE(WowWindowMatches(L"", L"World of Warcraft"));
-  CHECK_FALSE(WowWindowMatches(nullptr, L"World of Warcraft"));
-}
-
 TEST_CASE("class specificity is judged by length", "[unit]") {
   CHECK(ClassNameIsSpecificEnough(L"GxWindowClass"));
   CHECK(ClassNameIsSpecificEnough(L"waApplication Window"));
@@ -122,26 +95,14 @@ TEST_CASE("tracker reports a move", "[unit]") {
   DestroyWindow(hwnd);
 }
 
-TEST_CASE("FindWowWindow returns nothing when WoW is not running", "[unit]") {
-  // The suite does not launch WoW. This asserts the negative path is clean
-  // rather than throwing or returning a stale handle.
-  bool anyPresent = false;
-  for (const wchar_t* className : kWowWindowClasses) {
-    if (FindWindowW(className, nullptr) != nullptr) anyPresent = true;
-  }
-  if (!anyPresent) {
-    REQUIRE(FindWowWindow().has_value() == false);
-  }
+TEST_CASE("an unchosen target matches nothing", "[unit]") {
+  // An empty class is "nothing chosen yet": it must never fall back to a
+  // search, or the overlay would capture some arbitrary window.
+  REQUIRE(FindAppWindow(AppMatch{}).has_value() == false);
 }
 
-TEST_CASE("both the retail and Classic window classes are recognised", "[unit]") {
-  // Retail registers "waApplication Window"; missing it is why the runtime
-  // failed to see a running game.
-  bool retail = false, classic = false;
-  for (const wchar_t* className : kWowWindowClasses) {
-    if (std::wstring_view(className) == L"waApplication Window") retail = true;
-    if (std::wstring_view(className) == L"GxWindowClass") classic = true;
-  }
-  REQUIRE(retail);
-  REQUIRE(classic);
+TEST_CASE("a class that is not running is not found", "[unit]") {
+  AppMatch match;
+  match.windowClass = L"SidecarNoSuchClassAnywhere";
+  REQUIRE(FindAppWindow(match).has_value() == false);
 }

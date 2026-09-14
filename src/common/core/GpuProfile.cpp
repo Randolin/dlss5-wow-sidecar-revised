@@ -121,21 +121,23 @@ std::optional<VideoMemory> QueryVideoMemory(LUID adapter) {
   ComPtr<IDXGIAdapter3> adapter3;
   if (FAILED(adapter1.As(&adapter3))) return std::nullopt;
 
-  // LOCAL is the memory on the card; NON_LOCAL is system memory the driver
-  // falls back to when the card is full. Both are worth having: the first is
-  // what we are using, the second is whether we have already been evicted.
+  // LOCAL is the memory on the card. NON_LOCAL is system memory -- but that
+  // is not only eviction: upload and readback heaps live there by design (the
+  // synthetic depth upload alone is 33 MB at 4K), and so does whatever the
+  // vendor runtimes stage. So non-local usage is reported as what it is, and
+  // the eviction alarm is the honest one: local usage past the local budget.
   DXGI_QUERY_VIDEO_MEMORY_INFO local{};
   if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
     return std::nullopt;
   }
   DXGI_QUERY_VIDEO_MEMORY_INFO nonLocal{};
-  // A failure here is not fatal; it costs the eviction alarm, not the reading.
   adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonLocal);
 
   VideoMemory out;
   out.budgetBytes = local.Budget;
   out.usedBytes = local.CurrentUsage;
-  out.spilledBytes = nonLocal.CurrentUsage;
+  out.systemBytes = nonLocal.CurrentUsage;
+  out.spilledBytes = local.CurrentUsage > local.Budget ? local.CurrentUsage - local.Budget : 0;
   return out;
 }
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(dlss5-wow-sidecar LANGUAGES CXX)
+project(dlss5-sidecar LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "Windows-only project (spec: Global Constraints).")
@@ -63,9 +63,17 @@ compile_compute_shader(FormatNormalize)
 compile_compute_shader(FlowToMotionVec)
 compile_compute_shader(LuminanceR8)
 compile_compute_shader(UiMaskBlend)
+compile_compute_shader(NrEncode)
+compile_compute_shader(NrResolve)
+compile_compute_shader(NrCompose)
+compile_compute_shader(NrTemporal)
+compile_compute_shader(HdrToSdr)
+compile_compute_shader(HdrCompose)
 
 add_library(sidecar_common STATIC)
-target_include_directories(sidecar_common PUBLIC src/common)
+# src/common for the library's own headers; src so the forwarder's ABI header
+# is reachable as forwarder/nvngx_forwarder_abi.h from both sides.
+target_include_directories(sidecar_common PUBLIC src/common src)
 target_link_libraries(sidecar_common PUBLIC
   d3d11 d3d12 dxgi dxguid dcomp windowsapp bcrypt tomlplusplus::tomlplusplus)
 target_sources(sidecar_common PRIVATE
@@ -73,24 +81,32 @@ target_sources(sidecar_common PRIVATE
   src/common/core/LatencyStats.cpp
   src/common/core/Config.cpp
   src/common/core/ControlChannel.cpp
+  src/common/core/Hotkeys.cpp
+  src/common/core/Text.cpp
   src/common/core/Log.cpp
+  src/common/core/ImageDump.cpp
+  src/common/core/UiCalibration.cpp
   src/common/core/Sha256.cpp
   src/common/core/PanicSwitch.cpp
   src/common/gpu/DeviceBridge.cpp
   src/common/gpu/FormatNormalize.cpp
   src/common/gpu/Luminance.cpp
   src/common/gpu/UiMask.cpp
+  src/common/gpu/NrColorBridge.cpp
+  src/common/gpu/NrTemporal.cpp
+  src/common/gpu/HdrBridge.cpp
   src/common/flow/NvofaFlow.cpp
   src/common/flow/FlowToMotionVec.cpp
   src/common/capture/WgcSource.cpp
   src/common/present/DCompOverlay.cpp
   src/common/present/WindowTracker.cpp
+  src/common/present/HdrDisplay.cpp
   src/common/present/Hud.cpp
-  src/common/neural/AddonSettings.cpp
   src/common/neural/PassthroughPass.cpp
   src/common/neural/RuntimeManifest.cpp
   src/common/neural/NgxSession.cpp
-  src/common/neural/ReshadeHostedPass.cpp
+  src/common/neural/NrForwarder.cpp
+  src/common/neural/DirectNrPass.cpp
   src/common/neural/NeuralPassFactory.cpp)
 
 # The NVIDIA Optical Flow SDK is a manual download and is never vendored (I11).
@@ -140,14 +156,33 @@ target_include_directories(sidecar_common PUBLIC ${CMAKE_BINARY_DIR}/generated)
 target_compile_options(sidecar_common PUBLIC /await:strict)
 target_link_libraries(sidecar_common PUBLIC windowsapp)
 
-add_executable(wowsidecar WIN32
+add_executable(sidecar WIN32
   src/runtime/main.cpp
   src/runtime/Pipeline.cpp)
-target_include_directories(wowsidecar PRIVATE src)
-target_link_libraries(wowsidecar PRIVATE sidecar_common shell32)
-add_invariant_check(wowsidecar)
+target_include_directories(sidecar PRIVATE src)
+target_link_libraries(sidecar PRIVATE sidecar_common shell32)
+add_invariant_check(sidecar)
 
-add_executable(wowsidecar-manager WIN32
+# The neural-rendering forwarder. The runtime accepts calls only from a module
+# whose path contains "nvngx.dll" (see src/forwarder/nvngx_forwarder.cpp), so
+# this library is named for exactly that and does nothing else. It is ours, so
+# it goes through the same import-table check as the executables; it needs no
+# SDK and builds unconditionally.
+add_library(nvngx_forwarder SHARED src/forwarder/nvngx_forwarder.cpp)
+set_target_properties(nvngx_forwarder PROPERTIES
+  OUTPUT_NAME "nvngx.dll_sidecar"
+  PREFIX ""
+  SUFFIX ".dll")
+target_include_directories(nvngx_forwarder PRIVATE src)
+add_invariant_check(nvngx_forwarder)
+# Beside the runtime, since that is where it is looked for.
+add_dependencies(sidecar nvngx_forwarder)
+add_custom_command(TARGET sidecar POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:nvngx_forwarder> $<TARGET_FILE_DIR:sidecar>
+  VERBATIM)
+
+add_executable(sidecar-manager WIN32
   src/manager/main.cpp
   src/manager/Install.cpp
   src/manager/Probes.cpp
@@ -158,25 +193,16 @@ add_executable(wowsidecar-manager WIN32
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
-target_include_directories(wowsidecar-manager PRIVATE
+target_include_directories(sidecar-manager PRIVATE
   src ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_link_libraries(wowsidecar-manager PRIVATE sidecar_common shell32 comdlg32 dwmapi)
+target_link_libraries(sidecar-manager PRIVATE sidecar_common shell32 comdlg32 dwmapi)
 
-# Keep ReShade out of the manager.
-#
-# ReShade ships as a dxgi.dll that has to sit beside wowsidecar.exe, and both
-# executables live in the same directory. Statically importing DXGI or D3D11
-# would hand the manager ReShade's copy at load time, which drags in the add-on
-# and a 160 MB neural runtime for a control panel that renders one ImGui window
-# -- and writes a ReShade.log about the manager that reads exactly like the
-# runtime's.
-#
-# Delay-loading both means neither is resolved until first use, by which point
-# PinSystemGraphicsDlls has already loaded the System32 copies under those base
-# names, and the loader will not look for a second module with a name it has.
-target_link_options(wowsidecar-manager PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:d3d11.dll)
-target_link_libraries(wowsidecar-manager PRIVATE delayimp)
-add_invariant_check(wowsidecar-manager)
+# Delay-load DXGI and D3D11 in the manager and pin the System32 copies first
+# (PinSystemGraphicsDlls), so a proxy DLL of either name left beside the
+# executables by some other tool is never consulted by the control panel.
+target_link_options(sidecar-manager PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:d3d11.dll)
+target_link_libraries(sidecar-manager PRIVATE delayimp)
+add_invariant_check(sidecar-manager)
 
 add_executable(testpattern WIN32
   src/testpattern/main.cpp
@@ -210,16 +236,6 @@ if(DLSS_SDK_DIR)
   target_include_directories(spike_snippet PRIVATE "${DLSS_SDK_DIR}/include")
   target_link_libraries(spike_snippet PRIVATE
     d3d12 dxgi
-    "$<$<CONFIG:Debug>:${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib>"
-    "$<$<NOT:$<CONFIG:Debug>>:${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>")
-
-  # Task 4's spike. Must be run from a scratch directory holding ReShade and the
-  # add-on -- never from the build output directory, since a ReShade dxgi.dll
-  # sitting next to wowsidecar.exe would be injected into it on its next run.
-  add_executable(spike_reshade tools/spike_reshade/main.cpp)
-  target_include_directories(spike_reshade PRIVATE "${DLSS_SDK_DIR}/include")
-  target_link_libraries(spike_reshade PRIVATE
-    d3d12 dxgi dcomp psapi
     "$<$<CONFIG:Debug>:${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib>"
     "$<$<NOT:$<CONFIG:Debug>>:${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>")
 endif()

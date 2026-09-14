@@ -67,6 +67,9 @@ TEST_CASE("pipeline runs end to end over the test pattern", "[device]") {
   auto pipeline = Pipeline::Create(*gpu, cfg, PassthroughPass::Create());
   REQUIRE(pipeline != nullptr);
   pipeline->Start();
+  // The render thread idles while the target is not foreground; under a test
+  // runner nothing guarantees the pattern window is, so say so.
+  pipeline->OnForegroundChanged(app.hwnd);
 
   // Let it settle, then require real throughput.
   std::this_thread::sleep_for(3s);
@@ -114,6 +117,7 @@ TEST_CASE("pipeline runs with a UI mask configured", "[device]") {
   auto pipeline = Pipeline::Create(*gpu, cfg, PassthroughPass::Create());
   REQUIRE(pipeline != nullptr);
   pipeline->Start();
+  pipeline->OnForegroundChanged(app.hwnd);
 
   std::this_thread::sleep_for(3s);
   INFO("lastError='" << pipeline->LastError() << "'");
@@ -145,6 +149,9 @@ TEST_CASE("pipeline hides the overlay when the target window closes", "[device]"
   auto pipeline = Pipeline::Create(*gpu, cfg, PassthroughPass::Create());
   REQUIRE(pipeline != nullptr);
   pipeline->Start();
+  // The overlay only shows while the target has the foreground; under a test
+  // runner nothing guarantees the pattern window does, so say so.
+  pipeline->OnForegroundChanged(app->hwnd);
   PumpFor(500ms);
 
   const HWND overlay = pipeline->OverlayHwnd();

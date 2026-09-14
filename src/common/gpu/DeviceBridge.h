@@ -29,7 +29,8 @@ class DeviceBridge {
  public:
   static constexpr uint32_t kRingDepth = 3;
 
-  static std::unique_ptr<DeviceBridge> Create(LUID adapterLuid, uint32_t width, uint32_t height);
+  static std::unique_ptr<DeviceBridge> Create(LUID adapterLuid, uint32_t width, uint32_t height,
+                                              DXGI_FORMAT ringFormat = DXGI_FORMAT_B8G8R8A8_UNORM);
   ~DeviceBridge();
 
   ID3D11Device5* D3d11() const { return d3d11_.Get(); }
@@ -40,12 +41,22 @@ class DeviceBridge {
 
   uint32_t Width() const { return width_; }
   uint32_t Height() const { return height_; }
+  // BGRA8 for an SDR capture; RGBA16F (scRGB linear) for an HDR one. Every
+  // frame in the ring, and everything copied from it, is in this format.
+  DXGI_FORMAT RingFormat() const { return format_; }
 
   // Capture thread. Copies src into the next ring slot on the D3D11 queue,
   // signals the shared fence, and publishes the slot.
   // Latest-wins: returns true when it overwrote a frame the render thread had
   // not yet consumed, which the caller records as a drop.
   bool Publish(ID3D11Texture2D* src);
+
+  // Render thread. Blocks until a frame is published or the timeout expires;
+  // returns true if one is waiting. Polling with Sleep(1) is not an
+  // alternative: a process that has not raised the timer resolution sleeps to
+  // the next 15.6 ms tick, which quantises the whole overlay to well under the
+  // capture rate. The event is auto-reset and signalled by Publish.
+  bool WaitForFrame(uint32_t timeoutMs) const;
 
   // Render thread. Returns the newest published-but-unconsumed frame and marks
   // it consumed. The caller must have the queue wait on SharedFence() at the
@@ -54,6 +65,7 @@ class DeviceBridge {
 
  private:
   DeviceBridge() = default;
+  bool Commit();
 
   struct Slot {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> tex11;
@@ -80,6 +92,9 @@ class DeviceBridge {
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;
+  DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
+  // Signalled by Publish, waited on by the render thread.
+  HANDLE frameReady_ = nullptr;
 };
 
 }  // namespace sidecar

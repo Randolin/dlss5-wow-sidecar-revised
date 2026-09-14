@@ -1,6 +1,7 @@
 #include "capture/WgcSource.h"
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -10,6 +11,7 @@
 #include <wrl/client.h>
 
 #include "gpu/DeviceBridge.h"
+#include "core/Log.h"
 
 using Microsoft::WRL::ComPtr;
 namespace wgc = winrt::Windows::Graphics::Capture;
@@ -48,21 +50,39 @@ ComPtr<ID3D11Texture2D> SurfaceToTexture(
 
 }  // namespace
 
-std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target,
-                                                      DeviceBridge& bridge,
+std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target, DeviceBridge& bridge,
                                                       DropCallback onDrop) {
   if (!wgc::GraphicsCaptureSession::IsSupported()) return nullptr;
 
   auto interop = winrt::get_activation_factory<wgc::GraphicsCaptureItem>()
                      .as<IGraphicsCaptureItemInterop>();
   wgc::GraphicsCaptureItem item{nullptr};
-  if (FAILED(interop->CreateForWindow(
-          target, winrt::guid_of<wgc::GraphicsCaptureItem>(), winrt::put_abi(item)))) {
+  if (FAILED(interop->CreateForWindow(target, winrt::guid_of<wgc::GraphicsCaptureItem>(),
+                                      winrt::put_abi(item)))) {
     return nullptr;
   }
 
   auto device = WrapDevice(bridge.D3d11());
   if (!device) return nullptr;
+
+  // The frame pool is sized from the capture item, which reports physical
+  // pixels whatever this process's DPI mode; the bridge ring was sized from
+  // the window's client rect, which is virtualised when the process is
+  // DPI-unaware. If the two disagree every Publish() is a CopyResource between
+  // mismatched textures, which D3D11 drops without a word, and the overlay is
+  // black at full frame rate. Refuse loudly rather than run silently wrong.
+  const auto size = item.Size();
+  GlobalLog().Info("capture item " + std::to_string(size.Width) + "x" +
+                   std::to_string(size.Height) + ", bridge ring " +
+                   std::to_string(bridge.Width()) + "x" + std::to_string(bridge.Height()));
+  if (static_cast<uint32_t>(size.Width) != bridge.Width() ||
+      static_cast<uint32_t>(size.Height) != bridge.Height()) {
+    GlobalLog().Error(
+        "capture item and bridge ring differ in size; the process is probably "
+        "not DPI-aware and the desktop is scaled. Refusing to capture into a "
+        "ring that cannot receive the frames.");
+    return nullptr;
+  }
 
   std::unique_ptr<WgcSource> s(new WgcSource());
   s->target_ = target;
@@ -73,10 +93,16 @@ std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target,
   s->impl_->item = item;
 
   // Free-threaded so frames arrive on a pool thread rather than needing a
-  // message loop on the capture thread.
+  // message loop on the capture thread. The pool's pixel format follows the
+  // ring's: FP16 for an HDR desktop, so the compositor hands over the scRGB
+  // surface intact rather than tone-clipped into 8 bits.
+  const bool hdr = bridge.RingFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
   s->impl_->pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-      device, wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+      device,
+      hdr ? wgdx::DirectXPixelFormat::R16G16B16A16Float
+          : wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
       static_cast<int32_t>(DeviceBridge::kRingDepth), item.Size());
+  GlobalLog().Info(hdr ? "capture: FP16 scRGB (HDR desktop)" : "capture: BGRA8 (SDR desktop)");
 
   Impl* impl = s->impl_.get();
   impl->frameToken = impl->pool.FrameArrived(
@@ -85,7 +111,7 @@ std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target,
         if (!frame) return;
         auto tex = SurfaceToTexture(frame.Surface());
         if (!tex) return;
-        const bool dropped = impl->bridge->Publish(tex.Get());
+        bool dropped = impl->bridge->Publish(tex.Get());
         impl->owner->delivered_.fetch_add(1, std::memory_order_relaxed);
         if (dropped && impl->onDrop) impl->onDrop();
       });
@@ -95,8 +121,30 @@ std::unique_ptr<WgcSource> WgcSource::CreateForWindow(HWND target,
   });
 
   s->impl_->session = s->impl_->pool.CreateCaptureSession(item);
-  s->impl_->session.IsCursorCaptureEnabled(false);   // WoW draws its own cursor
+  s->impl_->session.IsCursorCaptureEnabled(false);   // the app draws its own cursor
   s->impl_->session.IsBorderRequired(false);         // no yellow capture border
+
+  // The throttle that was holding everything to 60. Windows 11 24H2 added a
+  // per-session minimum update interval and its default is 16.67 ms -- one
+  // frame at 60 Hz -- for window and monitor capture alike, whatever the game
+  // or the display are doing. Ask for the display's own period instead. On an
+  // older Windows the property does not exist and the default behaviour
+  // (compositor-paced) is what it always was.
+  if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+          L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
+    // 100-nanosecond units: 1 ms. "As fast as the compositor has frames."
+    const winrt::Windows::Foundation::TimeSpan interval{10000};
+    try {
+      s->impl_->session.MinUpdateInterval(interval);
+      GlobalLog().Info("capture: minimum update interval set to 1 ms (the OS default is "
+                       "16.67 ms, which caps capture at 60 fps)");
+    } catch (const winrt::hresult_error& e) {
+      GlobalLog().Warn("capture: could not set the minimum update interval (" +
+                       winrt::to_string(e.message()) + "); capture may be capped at 60 fps");
+    }
+  } else {
+    GlobalLog().Info("capture: this Windows has no MinUpdateInterval; capture is compositor-paced");
+  }
   return s;
 }
 
