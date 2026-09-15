@@ -17,10 +17,10 @@ namespace {
 // so a typo is visible rather than silently ignored. The retired keys of the
 // ReShade-hosted route are accepted silently so an old file does not warn
 // about its own history.
-constexpr std::array<std::string_view, 15> kKnownKeys = {
+constexpr std::array<std::string_view, 16> kKnownKeys = {
     "show_hud", "show_overlay", "flow_grid_size", "neural_pass", "synthetic_depth",
     "ui_mask",  "ui_mask_feather", "active_preset", "app", "hotkeys", "nr",
-    "depth_mode", "depth_inverted", "app_look", "advanced_tuning",
+    "depth_mode", "depth_inverted", "app_look", "advanced_tuning", "logging",
 };
 constexpr std::array<std::string_view, 4> kRetiredKeys = {
     "dlss_preset", "neural", "wow_dir", "capture_mode",
@@ -143,6 +143,7 @@ void ReadNrPass(const toml::table& table, NrPassSettings& s, const std::string& 
                           k == "evaluate_every" || k == "final_pass_full" ||
                           k == "per_pass_tuning" || k == "split_view" ||
                           k == "motion_vectors" || k == "model_temporal" ||
+                          k == "target_fps" ||
                           k == "hdr_headroom";   // headroom/reproject/every are retired
     if (passKey) continue;
     if (frameKey && topLevel) continue;
@@ -338,8 +339,21 @@ Config ParseConfig(std::string_view text, std::vector<std::string>& warnings) {
       ReadString(*table, "next_preset", config.hotkeys.nextPreset, warnings);
       ReadString(*table, "previous_preset", config.hotkeys.previousPreset, warnings);
       ReadString(*table, "dump_frames", config.hotkeys.dumpFrames, warnings);
+      ReadString(*table, "record_timings", config.hotkeys.recordTimings, warnings);
     } else {
       warnings.emplace_back("hotkeys: expected a table; ignored");
+    }
+  }
+
+  if (const auto node = root.get("logging")) {
+    if (const auto* table = node->as_table()) {
+      ReadBool(*table, "verbose", config.logging.verbose, warnings);
+      ReadBool(*table, "performance", config.logging.performance, warnings);
+      ReadBool(*table, "stages", config.logging.stages, warnings);
+      ReadBool(*table, "capture", config.logging.capture, warnings);
+      ReadBool(*table, "neural", config.logging.neural, warnings);
+    } else {
+      warnings.emplace_back("logging: expected a table; ignored");
     }
   }
 
@@ -414,6 +428,17 @@ std::string SerializeConfig(const Config& config) {
   out << "next_preset = " << Quoted(config.hotkeys.nextPreset) << "\n";
   out << "previous_preset = " << Quoted(config.hotkeys.previousPreset) << "\n";
   out << "dump_frames = " << Quoted(config.hotkeys.dumpFrames) << "\n";
+  out << "record_timings = " << Quoted(config.hotkeys.recordTimings) << "\n";
+
+  out << "\n# The recurring log lines. All off by default; warnings, errors and system\n"
+         "# events are always written whatever this says. \"verbose\" is the master\n"
+         "# switch: off silences every category without forgetting the selection.\n";
+  out << "[logging]\n";
+  out << "verbose = " << Boolean(config.logging.verbose) << "\n";
+  out << "performance = " << Boolean(config.logging.performance) << "\n";
+  out << "stages = " << Boolean(config.logging.stages) << "\n";
+  out << "capture = " << Boolean(config.logging.capture) << "\n";
+  out << "neural = " << Boolean(config.logging.neural) << "\n";
 
   out << "\n# The neural-rendering path. The model's own knobs; ranges are the model's\n"
          "# (preset 0-3, style 0-2, strengths 0-2, skin structure -1 for off). Each\n"

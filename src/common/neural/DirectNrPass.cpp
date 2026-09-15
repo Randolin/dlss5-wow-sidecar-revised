@@ -455,7 +455,15 @@ void DirectNrPass::CollectStages() {
   stages.emplace_back("input", span(0, 1));
   for (size_t i = 0; i < stagePasses_; ++i) {
     const uint32_t evalEnd = static_cast<uint32_t>(2 + 2 * i);
-    stages.emplace_back("pass" + std::to_string(i + 1), span(evalEnd - 1, evalEnd));
+    const double ms = span(evalEnd - 1, evalEnd);
+    stages.emplace_back("pass" + std::to_string(i + 1), ms);
+    if (recording_ && ms > 0.0) {
+      const auto bucket = static_cast<uint32_t>(ms);
+      ++passHistogram_[std::min(bucket, kHistogramBuckets - 1)];
+      if (histogramSamples_ == 0 || ms < histogramMinMs_) histogramMinMs_ = ms;
+      if (ms > histogramMaxMs_) histogramMaxMs_ = ms;
+      ++histogramSamples_;
+    }
     if (stageChained_ && i + 1 < stagePasses_) {
       stages.emplace_back("chain" + std::to_string(i + 1), span(evalEnd, evalEnd + 1));
     }
@@ -471,6 +479,50 @@ void DirectNrPass::CollectStages() {
   D3D12_RANGE wrote{0, 0};
   stageReadback_->Unmap(0, &wrote);
   lastStages_ = std::move(stages);
+}
+
+void DirectNrPass::StartRecordingTimings() {
+  passHistogram_.fill(0);
+  histogramSamples_ = 0;
+  histogramMinMs_ = 0.0;
+  histogramMaxMs_ = 0.0;
+  recording_ = true;
+}
+
+std::string DirectNrPass::PassHistogram() const {
+  if (histogramSamples_ == 0) return {};
+  uint32_t peak = 0;
+  uint32_t lowest = kHistogramBuckets;
+  uint32_t highest = 0;
+  for (uint32_t i = 0; i < kHistogramBuckets; ++i) {
+    peak = std::max(peak, passHistogram_[i]);
+    if (passHistogram_[i] > 0) {
+      lowest = std::min(lowest, i);
+      highest = i;
+    }
+  }
+  if (peak == 0) return {};
+
+  char header[192];
+  std::snprintf(header, sizeof(header),
+                "per-pass GPU time, %llu samples, %.1f to %.1f ms:",
+                static_cast<unsigned long long>(histogramSamples_), histogramMinMs_,
+                histogramMaxMs_);
+  std::string out = header;
+
+  // Only the occupied range, so an idle tail does not bury the shape. Bars are
+  // scaled to the tallest bucket; the count is what actually matters and is
+  // printed alongside.
+  for (uint32_t i = lowest; i <= highest; ++i) {
+    const uint32_t count = passHistogram_[i];
+    const int width = static_cast<int>(40.0 * static_cast<double>(count) /
+                                       static_cast<double>(peak) + 0.5);
+    char line[128];
+    std::snprintf(line, sizeof(line), "\n  %2u-%2u ms | %-40s %u", i, i + 1,
+                  std::string(static_cast<size_t>(width), '#').c_str(), count);
+    out += line;
+  }
+  return out;
 }
 
 void DirectNrPass::CopyThrough(ID3D12GraphicsCommandList* cl, ID3D12Resource* color,
@@ -501,9 +553,10 @@ void DirectNrPass::TakePending() {
   }
   if (compose) {
     bridgeParams_ = *compose;
-    GlobalLog().Info("direct NR: compose updated live: strength " + Short(compose->strength) +
-                     ", colour preserve " + Short(compose->colourPreserve) +
-                     ", highlight protect " + Short(compose->highlightProtect));
+    GlobalLog().Verbose(LogCategory::Neural,
+                        "direct NR: compose updated live: strength " + Short(compose->strength) +
+                            ", colour preserve " + Short(compose->colourPreserve) +
+                            ", highlight protect " + Short(compose->highlightProtect));
   }
   if (setup) {
     // The GPU is idle between frames (the overlay's present waits on its

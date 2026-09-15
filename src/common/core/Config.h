@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/Log.h"
+
 namespace sidecar {
 
 struct UiRect {
@@ -109,8 +111,39 @@ struct HotkeySettings {
   std::string nextPreset = "ctrl+alt+pageup";
   std::string previousPreset = "ctrl+alt+pagedown";
   // Save debug frames without leaving the game: the dump happens on the
-  // frame after the press, camera motion and all.
+  // frame after the press, camera motion and all. It also ends a timing
+  // recording and prints its histogram, if one is running.
   std::string dumpFrames = "ctrl+alt+d";
+  // Start or stop accumulating per-pass GPU times. Starting clears whatever
+  // was there; stopping with this key discards it, stopping with the dump key
+  // prints it.
+  std::string recordTimings = "ctrl+alt+r";
+};
+
+// Which of the recurring log lines are written. All off by default: an
+// ordinary session should leave a log an operator can read, and these are the
+// per-window lines that bury it. System events, warnings and errors are never
+// affected by any of this.
+//
+// `verbose` is the master switch and the state of the manager's drawer. Off
+// silences every category without forgetting which ones were chosen, so
+// turning it back on restores the same selection.
+struct LogSettings {
+  bool verbose = false;
+  bool performance = false;
+  bool stages = false;
+  bool capture = false;
+  bool neural = false;
+
+  uint32_t Mask() const {
+    if (!verbose) return 0;
+    uint32_t mask = 0;
+    if (performance) mask |= static_cast<uint32_t>(LogCategory::Performance);
+    if (stages) mask |= static_cast<uint32_t>(LogCategory::Stages);
+    if (capture) mask |= static_cast<uint32_t>(LogCategory::Capture);
+    if (neural) mask |= static_cast<uint32_t>(LogCategory::Neural);
+    return mask;
+  }
 };
 
 struct Config {
@@ -150,6 +183,7 @@ struct Config {
 
   TargetAppSettings app;
   HotkeySettings hotkeys;
+  LogSettings logging;
   NrSettings nr;
 
   // Which look goes with which window, by window class. The manager applies

@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -115,7 +116,16 @@ class Pipeline {
   // Asks the render loop to write the neural pass's input and output, and the
   // presented frame, to BMPs beside the sidecar on its next frame, and to log
   // how much the pass changed the picture. Safe from any thread.
+  //
+  // Also takes the snapshot of a timing recording: if one is running it is
+  // printed and stopped, and if none is running the single frame's own stage
+  // breakdown is printed instead.
   void RequestDebugDump() { dumpRequested_.store(true, std::memory_order_release); }
+
+  // Starts a timing recording, or stops and discards one already running.
+  // Stopping with RequestDebugDump instead keeps the reading. Safe from any
+  // thread; a recording left running stops itself after kRecordTimeout.
+  void ToggleTimingRecord() { recordToggleRequested_.store(true, std::memory_order_release); }
 
   // The UI-mask calibrator's two captures. Step 1 stores the frame with the
   // interface drawn; step 2 diffs the current frame against it and writes the
@@ -354,6 +364,11 @@ class Pipeline {
   std::atomic<bool> rebuildRequested_{false};
   std::atomic<bool> targetLost_{false};
   std::atomic<bool> dumpRequested_{false};
+  std::atomic<bool> recordToggleRequested_{false};
+  // When the running recording started, so it can stop itself rather than
+  // accumulate for the rest of the session behind a forgotten keypress.
+  std::chrono::steady_clock::time_point recordBegan_{};
+  static constexpr int kRecordTimeoutSeconds = 120;
   // The number the next dump's filenames carry, so repeated dumps sit beside
   // each other instead of overwriting. Render thread only.
   uint32_t dumpIndex_ = 0;

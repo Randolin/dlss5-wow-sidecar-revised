@@ -2,6 +2,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -120,6 +121,23 @@ class DirectNrPass : public INeuralPass {
     return lastStages_;
   }
 
+  // Every pass's GPU duration, binned at 1 ms, over the frames of a recording
+  // -- not the few per second the log samples.
+  //
+  // The shape is the question. If the model has one cost and is being
+  // interrupted, the distribution is quantised: a peak at the true cost and
+  // further peaks at regular intervals above it, one per interruption. If the
+  // model itself runs in two modes, there are two peaks and nothing beyond
+  // them. A smooth spread means neither, and the cost really does vary
+  // continuously with load.
+  //
+  // Recording is explicit so a reading covers a known interval in a known
+  // place, rather than whatever happened to have elapsed. Starting clears.
+  void StartRecordingTimings();
+  void StopRecordingTimings() { recording_ = false; }
+  bool RecordingTimings() const { return recording_; }
+  std::string PassHistogram() const;
+
  private:
   DirectNrPass() = default;
 
@@ -214,6 +232,14 @@ class DirectNrPass : public INeuralPass {
   size_t stagePasses_ = 0;       // passes that frame, for the labels
   bool stageChained_ = false;
   std::vector<std::pair<std::string, double>> lastStages_;
+
+  // 1 ms buckets; the last one collects everything above it.
+  static constexpr uint32_t kHistogramBuckets = 96;
+  std::array<uint32_t, kHistogramBuckets> passHistogram_{};
+  uint64_t histogramSamples_ = 0;
+  double histogramMinMs_ = 0.0;
+  double histogramMaxMs_ = 0.0;
+  bool recording_ = false;
 };
 
 }  // namespace sidecar

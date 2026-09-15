@@ -285,6 +285,34 @@ TEST_CASE("the compose settings are whole-frame, not per pass", "[unit]") {
   REQUIRE(reread.nr.colourPreserve == 0.5f);
 }
 
+TEST_CASE("verbose logging is off by default and round-trips", "[unit]") {
+  std::vector<std::string> warnings;
+  const auto defaults = ParseConfig("", warnings);
+  REQUIRE(warnings.empty());
+  REQUIRE(defaults.logging.verbose == false);
+  REQUIRE(defaults.logging.Mask() == 0);
+
+  // The master switch silences everything without forgetting the selection,
+  // which is the whole reason it is separate from the categories.
+  Config config;
+  config.logging.performance = true;
+  config.logging.stages = true;
+  REQUIRE(config.logging.Mask() == 0);
+  config.logging.verbose = true;
+  REQUIRE(config.logging.Mask() ==
+          (static_cast<uint32_t>(LogCategory::Performance) |
+           static_cast<uint32_t>(LogCategory::Stages)));
+
+  std::vector<std::string> rewarn;
+  const auto reread = ParseConfig(SerializeConfig(config), rewarn);
+  REQUIRE(rewarn.empty());
+  REQUIRE(reread.logging.verbose == true);
+  REQUIRE(reread.logging.performance == true);
+  REQUIRE(reread.logging.stages == true);
+  REQUIRE(reread.logging.capture == false);
+  REQUIRE(reread.logging.neural == false);
+}
+
 TEST_CASE("per-app looks round-trip", "[unit]") {
   Config config;
   config.RememberLookForApp("GxWindowClass", "Cinematic Tuned");

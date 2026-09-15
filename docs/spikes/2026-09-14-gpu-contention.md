@@ -4,76 +4,125 @@
 
 ## The observation
 
-Same preset, same resolution, same two full-resolution passes, two zones:
+Same preset, same resolution, same two full-resolution passes at 4K, one
+machine (RTX 5090), two states of the same game:
 
-| Zone | Game fps | Captured | Presented | gpu (wait) per frame |
-|------|----------|----------|-----------|----------------------|
-| Silvermoon | ~60 (GPU-bound scene) | 60 | 44 | 21.7 ms |
-| Haranar | ~140 (light scene, uncapped) | 130 | 15 | 65-80 ms |
+| Target app | Presented | gpu work | Per-pass |
+|------------|-----------|----------|----------|
+| capped at 60 fps | ~34 | ~25 ms | 8-14 ms |
+| uncapped (~140 fps) | ~16 | ~50 ms | 19-32 ms |
 
-The neural work is a fixed cost and cannot care what is on screen, so the 3x
-swing is not the pipeline getting slower. Capping the game's foreground frame
-rate to 60 restored the presented rate to ~45 in Haranar, which confirms the
-cause is the game taking GPU the overlay needs -- but capping the game per title
-is exactly what a generic overlay must not require.
+Identical work, twice the wall-clock cost. Capping the game restores the
+overlay; nothing else tried does.
 
-## Two fixes tried
+## What the frame time is made of
+
+Per-stage GPU timestamps inside the neural command list showed the model is
+essentially the entire frame -- the input copy, the chained compose between
+passes and the final compose are together under half a millisecond. There is
+nothing to optimise in the sidecar's own compute.
+
+But the per-pass times were **bimodal**, snapping between two values for
+identical work rather than scattering, which a histogram over every frame
+settled.
+
+## The measurement that settled it
+
+Two recordings, same spot, standing still (motion median 0.1 px/frame), two
+passes with `model_scale` 0.5 and `final_pass_full` -- so pass one runs at
+1920x1080 and pass two at 3840x2160. Per-pass GPU time, 1 ms buckets:
+
+| Bucket | Capped at 60 | Uncapped (~140) |
+|--------|--------------|-----------------|
+| 3 ms   | 372          | 208             |
+| 8 ms   | 175          | 103             |
+| 13 ms  | 306          | 4               |
+| 18 ms  | --           | 48              |
+| 23 ms  | --           | 157             |
+| 28 ms  | --           | 85              |
+
+Peaks at a regular 5 ms interval, and **the leftmost peaks are identical in
+both runs**. The base cost does not move with load; only the weight shifts
+rightward.
+
+Two pass sizes explain peaks at 3 and 8. They cannot explain 18, 23 and 28 --
+there are only two passes. Those are the same work plus one, two, three or
+four interruptions of ~5 ms each.
+
+**The two passes really cost about 11 ms together: 3 for the half-resolution
+pass and 8 for the full-resolution one.** That is roughly 90 fps of neural
+work. Everything above it is time spent preempted while the app runs.
+
+This corrects an earlier conclusion recorded here. `gpu work` from the
+timestamps was read as proof that the work genuinely costs 45 ms; it is not.
+D3D12 timestamps are GPU wall clock, so an interleave lands inside the measured
+span. The work was always cheap.
+
+## Three fixes tried, all negative
 
 **Adaptive capture interval.** `MinUpdateInterval` was pinned at 1 ms, so
 capture requested ~130 fps while the overlay presented 15, and every discarded
-frame still cost a full-resolution copy into the ring. Driving the interval from
-the present rate (about 2x, clamped 1-33 ms) cut requests from ~130 to ~30.
+frame still cost a full-resolution copy into the ring. Driving the interval
+from the present rate cut requests from ~130 to ~30.
 
-Result: **no change to the presented rate.** The discarded copies were not the
-bottleneck. Kept anyway, on its own merits -- it stops real GPU work, bandwidth
-and power going into frames nobody consumes -- but its comments now claim only
-that.
+No change to the presented rate. Kept anyway, on its own merits -- it stops
+real GPU work, bandwidth and power going into frames nobody consumes -- but it
+is not a frame-rate fix and its comments say so.
 
-**HIGH command queue priority.** `D3D12_COMMAND_QUEUE_PRIORITY_HIGH` instead of
-the default, on the theory that the overlay was losing a scheduling fight to an
-uncapped game and would win it with a higher priority.
+**HIGH D3D12 command queue priority.** No measurable difference. Reverted.
+`D3D12_COMMAND_QUEUE_PRIORITY` arbitrates between queues *within* one process;
+the contention here is between two processes, so the setting was wired to
+nothing.
 
-Result: **no measurable difference.** Reverted. Whatever governs this is not
-reachable through queue priority -- plausibly because the contention is for
-memory bandwidth and clocks rather than for scheduling slots, or because queue
-priority does not arbitrate across processes the way it does within one.
+**HIGH WDDM process scheduling class**
+(`D3DKMTSetProcessSchedulingPriorityClass`, resolved from gdi32). This is the
+process-level equivalent and the correct layer in principle. The raise was
+granted -- the log confirmed `normal -> high` -- and the presented rate was
+unchanged: still ~34 capped, ~16 uncapped, in the same run with the raise
+active. Reverted.
 
-## Why neither result was conclusive about the cause
+## What this leaves
 
-The `gpu` figure in the log was `gpuWaitMs`: wall-clock time spent waiting on a
-fence. That includes time queued behind whatever else the GPU is doing, so
-"21.7 ms capped, 70 ms uncapped" is consistent with two different worlds:
+The GPU is one non-preemptible resource shared by two processes, one of which
+does not know the overlay exists. Preemption is not something a user-mode
+application can decline, and the 5 ms quantum looks like a scheduling
+granularity rather than anything of ours. There are only two ways to get a
+larger share: take less, or make the app take less. No scheduling hint reached
+from outside the app appears to move the split.
 
-1. Our work costs ~10 ms and we spend 60 ms queued. Contention for scheduling.
-2. Our work genuinely costs 70 ms because it executes with fewer resources --
-   less bandwidth, lower effective clocks, a colder cache.
+- **Take less.** Reduce what the model costs. Real, but the headroom is
+  smaller than it looked: the work is already down to ~11 ms.
+- **Make the app take less.** Cap its frame rate. Doing that from outside the
+  app means the NVAPI driver-profile limit, which works generically but writes
+  to the user's driver profile and must be restored on exit and after a crash.
+  Deferred; it wants an explicit opt-in.
 
-Those want different fixes, and nothing measured so far separates them.
+## What the ceiling actually is
 
-## What was added instead
+With the GPU to itself, this configuration would present around 90 fps, not the
+~22 the wall-clock timings implied. The distance between what the overlay gets
+and that ceiling is entirely how much GPU the app leaves it.
 
-D3D12 timestamp queries bracketing `cmdList2` (the neural passes and the
-compose), resolved into a readback buffer and read one frame late so nothing
-stalls. The performance line now carries both:
+That matters for the adaptive quality ladder: servoing on measured frame time
+would cut quality to fight interruptions, and cutting quality does not reduce
+interruptions. A ladder has to be driven by the presented rate against a target,
+not by how long a pass appeared to take.
 
-```
-per frame: gpu work 12.4, gpu wait 70.1, cpu 1.1, idle 0.0, present 0.0 ms
-```
+## The honest ceiling for the tool
 
-The gap between work and wait is the contention, measured rather than inferred.
+The sidecar needs GPU headroom to exist. An app that is already GPU-bound at 60
+fps has none, and capping it creates none -- there is nothing to reclaim. For
+those titles the overlay cannot run at this quality, and no amount of
+engineering changes that: the neural work has to fit somewhere.
 
-Phase one and the wait on the optical-flow queue sit outside the span
-deliberately, so a slow NVOFA does not read as expensive neural work.
+What *does* widen the range of usable apps is lowering the model's cost, since
+a cheaper configuration fits in a smaller gap. That makes the quality ladder
+less a compromise on frame rate and more the thing that decides which apps the
+tool works on at all.
 
-## What the numbers will mean
+## Loose end, now closed
 
-- **Work stays low, wait balloons.** Case 1. Our work is cheap and we are
-  queued. Nothing inside the pipeline recovers it, because the problem is not
-  our cost. Capping the app is then the only lever that works from outside its
-  process, which promotes the NVAPI driver-profile frame limit from "maybe" to
-  "necessary" -- see the adaptive quality plan.
-- **Work itself balloons.** Case 2. The work is genuinely more expensive under
-  contention. Reducing it helps proportionally, and the adaptive quality ladder
-  is the right answer.
-
-Measure before building either.
+The bimodal per-pass times were the thread worth pulling, and they resolved
+into the quantised distribution above rather than into a model with two speeds.
+The histogram that settled it is behind the record hotkey; a recording and a
+dump reproduce it in about thirty seconds.

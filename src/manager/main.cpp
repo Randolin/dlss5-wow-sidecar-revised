@@ -474,13 +474,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   };
 
   std::string presetNameUtf8(64, '\0');
-  std::string hotkeyBuffers[5];
+  std::string hotkeyBuffers[6];
   for (auto& b : hotkeyBuffers) b.resize(64);
   SetBuffer(hotkeyBuffers[0], config.hotkeys.toggleHud);
   SetBuffer(hotkeyBuffers[1], config.hotkeys.toggleOverlay);
   SetBuffer(hotkeyBuffers[2], config.hotkeys.nextPreset);
   SetBuffer(hotkeyBuffers[3], config.hotkeys.previousPreset);
   SetBuffer(hotkeyBuffers[4], config.hotkeys.dumpFrames);
+  SetBuffer(hotkeyBuffers[5], config.hotkeys.recordTimings);
 
   auto results = RunAllProbes(sidecarDir, config.app);
 
@@ -1128,12 +1129,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
            "\"ctrl+alt+key\" with at least one modifier. Applied when saved; the "
            "Status page shows which ones registered.");
       {
-        const char* labels[5] = {"Toggle HUD", "Toggle overlay", "Next look", "Previous look",
-                                 "Save debug frames"};
-        std::string* targets[5] = {&config.hotkeys.toggleHud, &config.hotkeys.toggleOverlay,
+        const char* labels[6] = {"Toggle HUD", "Toggle overlay", "Next look", "Previous look",
+                                 "Save debug frames", "Record pass timings"};
+        std::string* targets[6] = {&config.hotkeys.toggleHud, &config.hotkeys.toggleOverlay,
                                    &config.hotkeys.nextPreset, &config.hotkeys.previousPreset,
-                                   &config.hotkeys.dumpFrames};
-        for (int i = 0; i < 5; ++i) {
+                                   &config.hotkeys.dumpFrames, &config.hotkeys.recordTimings};
+        for (int i = 0; i < 6; ++i) {
           ImGui::PushID(i);
           ImGui::SetNextItemWidth(S(220.0f));
           if (ImGui::InputText(labels[i], hotkeyBuffers[i].data(), hotkeyBuffers[i].size())) {
@@ -1150,7 +1151,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
           ImGui::PopID();
         }
         Hint((std::string("Named keys: ") + kNamedKeys + ". Ctrl+Alt+Backspace always takes "
-              "the overlay down and cannot be rebound.").c_str());
+              "the overlay down and cannot be rebound. \"Record pass timings\" starts and "
+              "stops collecting per-pass GPU times; \"Save debug frames\" prints what was "
+              "collected, or this frame's own breakdown when nothing is recording.").c_str());
       }
 
       // ---- overlay
@@ -1608,6 +1611,40 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // --------------------------------------------------------------------- Log
     if (section == Section::Log) {
       SectionHeading("Log");
+
+      // The overlay's own logging, not the manager's. Saved immediately and
+      // pushed to a running overlay with the rest of the settings, so the
+      // choice survives a restart and takes effect without one.
+      bool loggingChanged = false;
+      if (ImGui::Checkbox("Verbose", &config.logging.verbose)) loggingChanged = true;
+      Hint("System events, warnings and errors are always written. These are the "
+           "recurring per-window lines that make a session's log thousands of lines "
+           "long -- useful while investigating something, noise the rest of the time. "
+           "Turning this off silences all of them without forgetting which are ticked.");
+      if (config.logging.verbose) {
+        ImGui::Indent(S(16.0f));
+        if (ImGui::Checkbox("Frame budget", &config.logging.performance)) {
+          loggingChanged = true;
+        }
+        Hint("Presented and captured rates, and where each frame's time went. One line "
+             "per reporting window, and only when the picture changes.");
+        if (ImGui::Checkbox("Pass timings", &config.logging.stages)) loggingChanged = true;
+        Hint("The GPU time of each neural pass and each compose, under the budget line. "
+             "This is what separates an expensive model from an interrupted one.");
+        if (ImGui::Checkbox("Capture rate", &config.logging.capture)) loggingChanged = true;
+        Hint("Written when the overlay re-aims how fast it asks the compositor for "
+             "frames, which follows the rate it can actually present.");
+        if (ImGui::Checkbox("Neural tuning", &config.logging.neural)) loggingChanged = true;
+        Hint("Compose parameters as they are handed to the running pass. One line per "
+             "slider movement, so this is loud while tuning and silent otherwise.");
+        ImGui::Unindent(S(16.0f));
+      }
+      if (loggingChanged) {
+        SaveConfig(configPath, config);
+        dirty = true;
+      }
+      ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
       const std::string lastError = GlobalLog().LastError();
       if (!lastError.empty()) {
         ImGui::TextColored(Rgb(g_colors.fail), "Last error");

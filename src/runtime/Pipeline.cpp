@@ -99,6 +99,19 @@ ComPtr<ID3D12Resource> CreateWorkTarget(ID3D12Device* dev, uint32_t w, uint32_t 
   return tex;
 }
 
+// Where the debug dumps go. A session's worth of BMPs beside the executable
+// buries the files that matter -- the config, the log, the operator-supplied
+// runtime DLLs -- so they get their own folder. Falls back to the runtime
+// directory if the folder cannot be created, because losing a diagnostic to a
+// permissions problem is worse than an untidy folder.
+std::filesystem::path DumpDirectory(const std::filesystem::path& runtimeDir) {
+  const auto dumps = runtimeDir / "dumps";
+  std::error_code ec;
+  std::filesystem::create_directories(dumps, ec);
+  if (ec) return runtimeDir;
+  return dumps;
+}
+
 // The first dump number not already on disk, starting the search at `from`.
 // Probing rather than counting from zero means a dump taken in an earlier
 // session is not silently overwritten by the first dump of this one.
@@ -655,12 +668,12 @@ void Pipeline::DumpDebugFrames() {
   const uint32_t w = dev_.bridge->Width();
   const uint32_t h = dev_.bridge->Height();
   if (!dev_.neuralTarget && !dev_.directResolve) {
-    // Said explicitly, because otherwise a missing nr_output.bmp with an input
+    // Said explicitly, because otherwise a missing nr_output BMP with an input
     // that equals the presented frame reads as a broken dump rather than what
     // it is: the neural pass is not the one running.
     GlobalLog().Warn(std::string("debug dump: the active pass is \"") + dev_.pass->Name() +
-                     "\", which has no neural output to dump; nr_output.bmp is not "
-                     "written and presented.bmp will match nr_input.bmp. See earlier "
+                     "\", which has no neural output to dump; nr_output is not "
+                     "written and presented will match nr_input. See earlier "
                      "lines for why the neural pass is not running.");
   }
   struct Item {
@@ -692,9 +705,10 @@ void Pipeline::DumpDebugFrames() {
 
   // A number per dump, shared by every image in it, so one press produces a
   // matched set and the next press does not overwrite it.
+  const auto dumpDir = DumpDirectory(config_.runtimeDir);
   std::vector<const char*> names;
   for (const auto& item : items) names.push_back(item.name);
-  dumpIndex_ = NextDumpIndex(config_.runtimeDir, dumpIndex_, names);
+  dumpIndex_ = NextDumpIndex(dumpDir, dumpIndex_, names);
   char suffix[16];
   std::snprintf(suffix, sizeof(suffix), "_%03u.bmp", dumpIndex_);
   ++dumpIndex_;
@@ -712,9 +726,10 @@ void Pipeline::DumpDebugFrames() {
                                  item.motion ? &motionStats : nullptr));
     if (item.motion && !images.back().empty()) haveMotionStats = true;
     if (images.back().empty()) continue;
-    const auto path = config_.runtimeDir / (std::string(item.name) + suffix);
+    const auto path = dumpDir / (std::string(item.name) + suffix);
     if (WriteBmp(path, w, h, images.back())) {
-      GlobalLog().Info(std::string("debug dump: wrote ") + path.filename().string());
+      GlobalLog().Info("debug dump: wrote " +
+                       path.lexically_relative(config_.runtimeDir).string());
     } else {
       GlobalLog().Error(std::string("debug dump: could not write ") + path.string());
     }
@@ -724,9 +739,9 @@ void Pipeline::DumpDebugFrames() {
   // plainly, because an all-black motion dump has two very different causes
   // and only one of them is interesting.
   if (!dev_.flow || !dev_.flow->Available()) {
-    GlobalLog().Warn("debug dump: optical flow is unavailable this session, so motion.bmp "
-                     "is a zero field -- that is the estimator missing, not the scene "
-                     "standing still.");
+    GlobalLog().Warn("debug dump: optical flow is unavailable this session, so the motion "
+                     "image is a zero field -- that is the estimator missing, not the "
+                     "scene standing still.");
   } else if (haveMotionStats) {
     // The numbers matter more than the picture: the BMP is scaled to this
     // frame's own 95th percentile, so its colours mean something different in
@@ -764,6 +779,30 @@ void Pipeline::DumpDebugFrames() {
                   100.0 * static_cast<double>(changed) / static_cast<double>(pixels));
     GlobalLog().Info(line);
   }
+
+  // The per-pass distribution, if a recording is running: print it and stop.
+  // With no recording running, print this frame's own stage breakdown instead,
+  // which is what a single-frame reading means.
+  if (auto* direct = dynamic_cast<DirectNrPass*>(dev_.pass.get())) {
+    if (direct->RecordingTimings()) {
+      const std::string histogram = direct->PassHistogram();
+      direct->StopRecordingTimings();
+      GlobalLog().Info(histogram.empty()
+                           ? std::string("debug dump: the recording caught no frames")
+                           : "debug dump: " + histogram);
+    } else {
+      std::string stages;
+      for (const auto& [name, ms] : direct->StageTimings()) {
+        char part[48];
+        std::snprintf(part, sizeof(part), "%s%s %.1f", stages.empty() ? "" : ", ",
+                      name.c_str(), ms);
+        stages += part;
+      }
+      if (!stages.empty()) {
+        GlobalLog().Info("debug dump: this frame (ms): " + stages);
+      }
+    }
+  }
 }
 
 void Pipeline::CalibrationCapture(int step) {
@@ -794,11 +833,12 @@ void Pipeline::CalibrationCapture(int step) {
 
   std::vector<uint8_t> diff;
   const auto rects = RectsFromDiff(calibrationWithUi_, frame, w, h, UiCalibrationParams{}, &diff);
+  const auto dumpDir = DumpDirectory(config_.runtimeDir);
 
   // The rectangles, as the config file would hold them, so the manager can
   // read them with the same parser it uses for sidecar.toml.
   {
-    std::ofstream out(config_.runtimeDir / "ui_mask_calibration.toml",
+    std::ofstream out(dumpDir / "ui_mask_calibration.toml",
                       std::ios::binary | std::ios::trunc);
     out << "# Written by the sidecar's UI-mask calibrator. Load it from the manager's\n"
            "# Tuning page; it is not read automatically. Coordinates are in the capture\n"
@@ -813,7 +853,7 @@ void Pipeline::CalibrationCapture(int step) {
   {
     std::vector<uint8_t> bgr(static_cast<size_t>(w) * h * 3);
     for (size_t p = 0; p < diff.size(); ++p) bgr[p * 3] = bgr[p * 3 + 1] = bgr[p * 3 + 2] = diff[p];
-    WriteBmp(config_.runtimeDir / "ui_mask_diff.bmp", w, h, bgr);
+    WriteBmp(dumpDir / "ui_mask_diff.bmp", w, h, bgr);
   }
 
   calibrationRects_.store(static_cast<uint32_t>(rects.size()), std::memory_order_release);
@@ -821,7 +861,8 @@ void Pipeline::CalibrationCapture(int step) {
   calibrationWithUi_.clear();
   GlobalLog().Info("calibration: found " + std::to_string(rects.size()) +
                    " interface rectangle(s); wrote ui_mask_calibration.toml and "
-                   "ui_mask_diff.bmp beside the sidecar.");
+                   "ui_mask_diff.bmp into " +
+                   dumpDir.lexically_relative(config_.runtimeDir).string() + ".");
 }
 
 bool Pipeline::ApplySettings(const PipelineConfig& incoming) {
@@ -1488,6 +1529,31 @@ void Pipeline::RenderLoop() {
     gpuWorkMs += dev_.lastGpuWorkMs;
 
     if (dumpRequested_.exchange(false, std::memory_order_acq_rel)) DumpDebugFrames();
+
+    // The recording toggle, and the timeout that closes one left running.
+    if (auto* direct = dynamic_cast<DirectNrPass*>(dev_.pass.get())) {
+      if (recordToggleRequested_.exchange(false, std::memory_order_acq_rel)) {
+        if (direct->RecordingTimings()) {
+          direct->StopRecordingTimings();
+          GlobalLog().Info("timing recording stopped and discarded; use the dump hotkey "
+                           "to stop one and keep the reading");
+        } else {
+          direct->StartRecordingTimings();
+          recordBegan_ = Clock::now();
+          GlobalLog().Info("timing recording started; every pass is being binned. Dump to "
+                           "print it, record again to discard it.");
+        }
+      }
+      if (direct->RecordingTimings() &&
+          std::chrono::duration<double>(Clock::now() - recordBegan_).count() >
+              kRecordTimeoutSeconds) {
+        const std::string histogram = direct->PassHistogram();
+        direct->StopRecordingTimings();
+        GlobalLog().Info("timing recording hit its " +
+                         std::to_string(kRecordTimeoutSeconds) +
+                         " second limit; printing what it has. " + histogram);
+      }
+    }
     if (const int step = calibrationRequest_.exchange(0, std::memory_order_acq_rel)) {
       CalibrationCapture(step);
     }
@@ -1547,11 +1613,13 @@ void Pipeline::RenderLoop() {
         model.modelHeight = direct->WorkHeight();
         model.passCount = static_cast<int>(direct->PassCount());
         stageLine.clear();
-        for (const auto& [name, ms] : direct->StageTimings()) {
-          char part[48];
-          std::snprintf(part, sizeof(part), "%s%s %.1f", stageLine.empty() ? "" : ", ",
-                        name.c_str(), ms);
-          stageLine += part;
+        if (GlobalLog().VerboseEnabled(LogCategory::Stages)) {
+          for (const auto& [name, ms] : direct->StageTimings()) {
+            char part[48];
+            std::snprintf(part, sizeof(part), "%s%s %.1f", stageLine.empty() ? "" : ", ",
+                          name.c_str(), ms);
+            stageLine += part;
+          }
         }
       }
       std::string presetName;
@@ -1644,8 +1712,10 @@ void Pipeline::RenderLoop() {
                         budget.recordMs, budget.idleMs, budget.presentWaitMs, stats_.P50(),
                         stats_.P99(),
                         static_cast<unsigned long long>(stats_.Dropped()));
-          GlobalLog().Info(line);
-          if (!stageLine.empty()) GlobalLog().Info("  stages (ms): " + stageLine);
+          GlobalLog().Verbose(LogCategory::Performance, line);
+          if (!stageLine.empty()) {
+            GlobalLog().Verbose(LogCategory::Stages, "  stages (ms): " + stageLine);
+          }
           lastPerfLine = summary;
           lastPerfReport = now;
         }

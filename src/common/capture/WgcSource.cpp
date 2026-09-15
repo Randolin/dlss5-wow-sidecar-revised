@@ -179,7 +179,7 @@ void WgcSource::SetMinUpdateIntervalMs(double ms) {
     std::snprintf(line, sizeof(line),
                   "capture: asking for a frame every %.1f ms (%.0f fps of requests)",
                   clamped, 1000.0 / clamped);
-    GlobalLog().Info(line);
+    GlobalLog().Verbose(LogCategory::Capture, line);
   } catch (const winrt::hresult_error& e) {
     // Stop trying rather than log once per update forever.
     impl_->canSetInterval = false;

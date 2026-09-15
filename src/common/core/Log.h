@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,20 @@
 namespace sidecar {
 
 enum class LogLevel { Info, Warn, Error };
+
+// The recurring lines, each of which can be silenced independently.
+//
+// System events and anything at Warn or Error are never categorised and are
+// always written: a log that can be configured into saying nothing about a
+// failure is worse than no log. These are the per-frame and per-window lines
+// that make a session's file thousands of lines long, and that only matter
+// while something specific is being investigated.
+enum class LogCategory : uint32_t {
+  Performance = 1u << 0,   // the per-window frame budget line
+  Stages = 1u << 1,        // the per-stage GPU breakdown under it
+  Capture = 1u << 2,       // capture-rate requests as they are re-aimed
+  Neural = 1u << 3,        // live tuning updates inside the neural pass
+};
 
 // File sink plus a fixed-capacity in-memory ring.
 //
@@ -45,6 +60,25 @@ class Log {
   // Lines a level below this are discarded, and are not counted as dropped.
   void SetMinimumLevel(LogLevel level);
 
+  // Which categories are written. Zero -- the default -- writes none of them,
+  // which is what keeps an ordinary session's log readable. Set from the
+  // config file and updated on a live reload; read on the render thread, so
+  // it is atomic rather than guarded.
+  void SetVerboseCategories(uint32_t mask) {
+    verbose_.store(mask, std::memory_order_relaxed);
+  }
+  uint32_t VerboseCategories() const { return verbose_.load(std::memory_order_relaxed); }
+  bool VerboseEnabled(LogCategory category) const {
+    return (VerboseCategories() & static_cast<uint32_t>(category)) != 0;
+  }
+
+  // Written only when its category is on. Costs an atomic load and nothing
+  // else when it is off -- but the caller still pays for building the string,
+  // so anything expensive to format should be guarded with VerboseEnabled.
+  void Verbose(LogCategory category, std::string_view message) {
+    if (VerboseEnabled(category)) Write(LogLevel::Info, message);
+  }
+
   std::vector<std::string> Recent() const;
 
   // Most recent Error line, so callers do not have to walk the ring for the
@@ -63,6 +97,7 @@ class Log {
   size_t count_ = 0;
   uint64_t dropped_ = 0;
   LogLevel minimum_ = LogLevel::Info;
+  std::atomic<uint32_t> verbose_{0};
   std::string lastError_;
   std::ofstream file_;
   std::chrono::steady_clock::time_point opened_ = std::chrono::steady_clock::now();

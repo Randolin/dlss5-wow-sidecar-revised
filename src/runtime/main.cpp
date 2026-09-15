@@ -132,6 +132,7 @@ enum HotkeyId : int {
   kHotkeyNextPreset = 0xB012,
   kHotkeyPreviousPreset = 0xB013,
   kHotkeyDumpFrames = 0xB014,
+  kHotkeyRecordTimings = 0xB015,
 };
 
 bool RegisterOneHotkey(int id, const std::string& text, const char* what) {
@@ -161,12 +162,15 @@ uint32_t RegisterHotkeys(const HotkeySettings& keys) {
   if (RegisterOneHotkey(kHotkeyNextPreset, keys.nextPreset, "next preset")) mask |= 4;
   if (RegisterOneHotkey(kHotkeyPreviousPreset, keys.previousPreset, "previous preset")) mask |= 8;
   if (RegisterOneHotkey(kHotkeyDumpFrames, keys.dumpFrames, "save debug frames")) mask |= 16;
+  if (RegisterOneHotkey(kHotkeyRecordTimings, keys.recordTimings, "record pass timings")) {
+    mask |= 32;
+  }
   return mask;
 }
 
 void UnregisterHotkeys() {
   for (const int id : {kHotkeyToggleHud, kHotkeyToggleOverlay, kHotkeyNextPreset,
-                       kHotkeyPreviousPreset, kHotkeyDumpFrames}) {
+                       kHotkeyPreviousPreset, kHotkeyDumpFrames, kHotkeyRecordTimings}) {
     UnregisterHotKey(nullptr, id);
   }
 }
@@ -216,6 +220,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   Config config;
   if (auto loaded = LoadConfig(configPath, warnings)) config = *loaded;
   ReportWarnings(warnings);
+  // Before anything starts logging per-frame lines.
+  GlobalLog().SetVerboseCategories(config.logging.Mask());
 
   const Target target = ResolveTarget(argc, argv, config.app);
   if (!target.hwnd) {
@@ -258,6 +264,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                                        : "settings changed: " + changes);
     }
     config = next;
+    GlobalLog().SetVerboseCategories(config.logging.Mask());
     const PipelineConfig cfg = BuildPipelineConfig(config, targetHwnd);
     if (raw->ApplySettings(cfg)) {
       GlobalLog().Info("settings applied live");
@@ -376,6 +383,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
           case kHotkeyDumpFrames:
             GlobalLog().Info("hotkey: saving debug frames");
             raw->RequestDebugDump();
+            break;
+          case kHotkeyRecordTimings:
+            raw->ToggleTimingRecord();
             break;
           default: break;
         }
